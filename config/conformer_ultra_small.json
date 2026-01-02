@@ -33,7 +33,8 @@
     "prefetch_factor": 2
   },
   "checkpoint": {
-    "checkpoint_path": "checkpoints/conformer_ultra_small_best.pt",
+    "checkpoint_path": "checkpoints/conformer_ultra_small_latest.pt",
+    "best_wer_path": "checkpoints/conformer_ultra_small_best_wer.pt",
     "save_dir": "checkpoints",
     "load_checkpoint": false
   },
@@ -43,5 +44,10 @@
     "memory_efficient": true,
     "pin_memory": true,
     "empty_cache_freq": 10
+  },
+  "wandb": {
+    "enabled": false,
+    "project": "conformer-asr",
+    "run_name": "conformer_ultra_small"
   }
 }

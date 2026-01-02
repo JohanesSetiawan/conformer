@@ -11,11 +11,13 @@ Supports:
   - Multi-GPU training (auto-detected)
   - Mixed precision training
   - Memory-efficient training
+  - Weights & Biases logging
 """
 
 import os
 import gc
 import argparse
+import random
 import torchaudio
 import torch
 import torch.nn.functional as F
@@ -27,6 +29,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
+from tqdm.auto import tqdm
 
 from model import ConformerEncoder, LSTMDecoder
 from utils import (
@@ -53,6 +56,67 @@ from utils import (
 parser = argparse.ArgumentParser("conformer")
 parser.add_argument('--config', type=str, required=True, help='Path to JSON config file')
 args = parser.parse_args()
+
+# Global wandb run (initialized later if enabled)
+wandb_run = None
+
+
+def init_wandb(config, device_info):
+    """Initialize Weights & Biases if enabled in config."""
+    global wandb_run
+
+    if not config.get('wandb', {}).get('enabled', False):
+        return None
+
+    try:
+        import wandb
+
+        wandb_config = config.get('wandb', {})
+        project_name = wandb_config.get('project', 'conformer-asr')
+        run_name = wandb_config.get('run_name', config['model']['name'])
+
+        wandb_run = wandb.init(
+            project=project_name,
+            name=run_name,
+            config={
+                'model': config['model'],
+                'training': config['training'],
+                'data': config['data'],
+                'hardware': config.get('hardware', {}),
+                'device': device_info['device_name'],
+            },
+            reinit=True,
+        )
+        print(f"Weights & Biases initialized: {wandb_run.url}")
+        return wandb_run
+    except ImportError:
+        print("Warning: wandb not installed. Install with: pip install wandb")
+        return None
+    except Exception as e:
+        print(f"Warning: Failed to initialize wandb: {e}")
+        return None
+
+
+def log_wandb(metrics, step=None):
+    """Log metrics to wandb if enabled."""
+    global wandb_run
+    if wandb_run is not None:
+        try:
+            import wandb
+            wandb.log(metrics, step=step)
+        except Exception:
+            pass
+
+
+def finish_wandb():
+    """Finish wandb run."""
+    global wandb_run
+    if wandb_run is not None:
+        try:
+            import wandb
+            wandb.finish()
+        except Exception:
+            pass
 
 
 def create_dataloaders(config, device_info, rank=0, world_size=1):
@@ -160,14 +224,14 @@ def create_model(config, device):
 
 
 def train_epoch(encoder, decoder, char_decoder, optimizer, scheduler, criterion,
-                grad_scaler, train_loader, config, device, device_info):
+                grad_scaler, train_loader, config, device, device_info, epoch):
     """Run a single training epoch with memory optimizations."""
     from torchmetrics.text.wer import WordErrorRate
 
     training_config = config['training']
     hardware_config = config.get('hardware', {})
 
-    wer = WordErrorRate()
+    wer_metric = WordErrorRate()
     error_rate = AvgMeter()
     avg_loss = AvgMeter()
     text_transform = get_text_transform()
@@ -177,13 +241,19 @@ def train_epoch(encoder, decoder, char_decoder, optimizer, scheduler, criterion,
 
     accumulate_iters = training_config.get('accumulate_iters', 1)
     gradient_clip_value = training_config.get('gradient_clip_value', 1.0)
-    report_freq = training_config.get('report_freq', 100)
     empty_cache_freq = hardware_config.get('empty_cache_freq', 10)
     use_amp = training_config.get('use_amp', True)
 
     optimizer.zero_grad()
 
-    for i, batch in enumerate(train_loader):
+    # Store last batch predictions for epoch summary
+    last_predictions = []
+    last_references = []
+
+    # Progress bar for training
+    pbar = tqdm(train_loader, desc=f"Training Epoch {epoch}", leave=True, dynamic_ncols=True)
+
+    for i, batch in enumerate(pbar):
         scheduler.step()
 
         # Periodic memory cleanup
@@ -210,10 +280,10 @@ def train_epoch(encoder, decoder, char_decoder, optimizer, scheduler, criterion,
                 label_lengths
             )
             # Scale loss for gradient accumulation
-            loss = loss / accumulate_iters
+            scaled_loss = loss / accumulate_iters
 
         # Backward pass
-        grad_scaler.scale(loss).backward()
+        grad_scaler.scale(scaled_loss).backward()
 
         # Gradient accumulation step
         if (i + 1) % accumulate_iters == 0:
@@ -230,28 +300,44 @@ def train_epoch(encoder, decoder, char_decoder, optimizer, scheduler, criterion,
             grad_scaler.update()
             optimizer.zero_grad()
 
-        # Track loss (use unscaled loss for logging)
-        avg_loss.update(loss.detach().item() * accumulate_iters)
+        # Track loss
+        avg_loss.update(loss.detach().item())
 
-        # Compute WER (less frequently to save memory)
-        if (i + 1) % report_freq == 0:
-            with torch.no_grad():
-                inds = char_decoder(outputs.detach())
-                predictions = [text_transform.int_to_text(sample) for sample in inds]
-                error_rate.update(wer(predictions, references) * 100)
+        # Compute predictions and WER
+        with torch.no_grad():
+            inds = char_decoder(outputs.detach())
+            predictions = [text_transform.int_to_text(sample) for sample in inds]
+            batch_wer = wer_metric(predictions, references) * 100
+            error_rate.update(batch_wer)
 
-            print(f'Step {i+1} - Avg WER: {error_rate.avg:.2f}%, Avg Loss: {avg_loss.avg:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
-            print(f'Sample Predictions: {predictions[:2]}')
+            # Store for epoch summary (keep last batch)
+            last_predictions = predictions
+            last_references = references
+
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f'{avg_loss.avg:.4f}',
+            'wer': f'{error_rate.avg:.2f}%',
+            'lr': f'{scheduler.get_last_lr()[0]:.6f}'
+        })
+
+        # Log to wandb periodically
+        if (i + 1) % 50 == 0:
+            log_wandb({
+                'train/step_loss': loss.detach().item(),
+                'train/step_wer': batch_wer,
+                'train/learning_rate': scheduler.get_last_lr()[0],
+            })
 
         # Free memory
         del spectrograms, labels, mask, outputs
-        if device_info['device'] != 'cpu':
-            torch.cuda.empty_cache()
 
-    return error_rate.avg if error_rate.avg else 0.0, avg_loss.avg
+    pbar.close()
+
+    return error_rate.avg if error_rate.avg else 0.0, avg_loss.avg, last_predictions, last_references
 
 
-def validate(encoder, decoder, char_decoder, criterion, test_loader, config, device, device_info):
+def validate(encoder, decoder, char_decoder, criterion, test_loader, config, device, device_info, epoch):
     """Evaluate model on test dataset."""
     from torchmetrics.text.wer import WordErrorRate
 
@@ -260,14 +346,21 @@ def validate(encoder, decoder, char_decoder, criterion, test_loader, config, dev
 
     avg_loss = AvgMeter()
     error_rate = AvgMeter()
-    wer = WordErrorRate()
+    wer_metric = WordErrorRate()
     text_transform = get_text_transform()
 
     encoder.eval()
     decoder.eval()
 
+    # Store last batch predictions for epoch summary
+    last_predictions = []
+    last_references = []
+
+    # Progress bar for validation
+    pbar = tqdm(test_loader, desc=f"Validation Epoch {epoch}", leave=True, dynamic_ncols=True)
+
     with torch.no_grad():
-        for i, batch in enumerate(test_loader):
+        for i, batch in enumerate(pbar):
             spectrograms, labels, input_lengths, label_lengths, references, mask = batch
 
             # Move to device
@@ -291,12 +384,39 @@ def validate(encoder, decoder, char_decoder, criterion, test_loader, config, dev
 
             inds = char_decoder(outputs.detach())
             predictions = [text_transform.int_to_text(sample) for sample in inds]
-            error_rate.update(wer(predictions, references) * 100)
+            batch_wer = wer_metric(predictions, references) * 100
+            error_rate.update(batch_wer)
+
+            # Store for epoch summary (keep last batch)
+            last_predictions = predictions
+            last_references = references
+
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f'{avg_loss.avg:.4f}',
+                'wer': f'{error_rate.avg:.2f}%'
+            })
 
             # Free memory
             del spectrograms, labels, mask, outputs
 
-    return error_rate.avg, avg_loss.avg
+    pbar.close()
+
+    return error_rate.avg, avg_loss.avg, last_predictions, last_references
+
+
+def save_best_wer_checkpoint(encoder, decoder, wer, epoch, checkpoint_path):
+    """Save checkpoint with best WER (model weights only)."""
+    checkpoint_dir = os.path.dirname(checkpoint_path)
+    if checkpoint_dir and not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    torch.save({
+        'epoch': epoch,
+        'best_wer': wer,
+        'encoder_state_dict': encoder.state_dict(),
+        'decoder_state_dict': decoder.state_dict(),
+    }, checkpoint_path)
 
 
 def main_worker(rank, world_size, config, device_info):
@@ -319,6 +439,10 @@ def main_worker(rank, world_size, config, device_info):
             device = torch.device('cpu')
 
     is_main_process = rank == 0
+
+    # Initialize wandb (only on main process)
+    if is_main_process:
+        init_wandb(config, device_info)
 
     if is_main_process:
         print(f"\n{'='*60}")
@@ -369,6 +493,7 @@ def main_worker(rank, world_size, config, device_info):
     # Load checkpoint if specified
     start_epoch = 0
     best_loss = float('inf')
+    best_wer = float('inf')
 
     if checkpoint_config.get('load_checkpoint', False):
         checkpoint_path = checkpoint_config['checkpoint_path']
@@ -394,14 +519,20 @@ def main_worker(rank, world_size, config, device_info):
     if is_main_process and checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # Define checkpoint paths
+    resume_checkpoint_path = checkpoint_config.get('checkpoint_path', os.path.join(checkpoint_dir, 'checkpoint_latest.pt'))
+    best_wer_checkpoint_path = checkpoint_config.get('best_wer_path', os.path.join(checkpoint_dir, 'best_wer.pt'))
+
     # Clear memory before training
     clear_memory()
 
     # Training loop
     for epoch in range(start_epoch, training_config['epochs']):
+        current_epoch = epoch + 1
+
         if is_main_process:
             print(f"\n{'='*60}")
-            print(f"Epoch {epoch + 1}/{training_config['epochs']}")
+            print(f"Epoch {current_epoch}/{training_config['epochs']}")
             print(f"{'='*60}")
 
         clear_memory()
@@ -415,36 +546,75 @@ def main_worker(rank, world_size, config, device_info):
             add_model_noise(dec_model, std=noise_std, device=device)
 
         # Train
-        wer, loss = train_epoch(
+        train_wer, train_loss, train_preds, train_refs = train_epoch(
             encoder, decoder, char_decoder, optimizer, scheduler,
-            criterion, grad_scaler, train_loader, config, device, device_info
+            criterion, grad_scaler, train_loader, config, device, device_info, current_epoch
         )
 
         # Validate
-        valid_wer, valid_loss = validate(
+        valid_wer, valid_loss, valid_preds, valid_refs = validate(
             encoder, decoder, char_decoder, criterion, test_loader,
-            config, device, device_info
+            config, device, device_info, current_epoch
         )
 
         if is_main_process:
-            print(f'\nEpoch {epoch + 1} Summary:')
-            print(f'  Train WER: {wer:.2f}%, Train Loss: {loss:.4f}')
-            print(f'  Valid WER: {valid_wer:.2f}%, Valid Loss: {valid_loss:.4f}')
+            # Select random samples for display (max 2)
+            num_samples = min(2, len(valid_preds))
+            if num_samples > 0:
+                indices = random.sample(range(len(valid_preds)), num_samples)
+                sample_preds = [valid_preds[i] for i in indices]
+                sample_refs = [valid_refs[i] for i in indices]
+            else:
+                sample_preds = []
+                sample_refs = []
 
-            # Save checkpoint if improved
+            # Print epoch summary
+            print(f"\nEpoch {current_epoch} Summary:")
+            print(f"  Train WER: {train_wer:.2f}%, Train Loss: {train_loss:.4f}")
+            print(f"  Valid WER: {valid_wer:.2f}%, Valid Loss: {valid_loss:.4f}")
+
+            # Log to wandb
+            log_wandb({
+                'epoch': current_epoch,
+                'train/epoch_wer': train_wer,
+                'train/epoch_loss': train_loss,
+                'valid/epoch_wer': valid_wer,
+                'valid/epoch_loss': valid_loss,
+                'learning_rate': scheduler.get_last_lr()[0],
+            }, step=current_epoch)
+
+            # Get models for saving
+            enc_to_save = encoder.module if device_info['use_distributed'] else encoder
+            dec_to_save = decoder.module if device_info['use_distributed'] else decoder
+
+            # Save checkpoint if validation loss improved
             if valid_loss <= best_loss:
-                print('  Validation loss improved, saving checkpoint...')
+                print(f"  Validation loss improved ({best_loss:.4f} -> {valid_loss:.4f}), saving checkpoint...")
                 best_loss = valid_loss
-
-                enc_to_save = encoder.module if device_info['use_distributed'] else encoder
-                dec_to_save = decoder.module if device_info['use_distributed'] else decoder
 
                 save_checkpoint(
                     enc_to_save, dec_to_save, optimizer, scheduler,
-                    valid_loss, epoch + 1, checkpoint_config['checkpoint_path']
+                    valid_loss, current_epoch, resume_checkpoint_path
                 )
 
-    # Cleanup distributed
+            # Save best WER checkpoint
+            if valid_wer <= best_wer:
+                print(f"  Best WER improved ({best_wer:.2f}% -> {valid_wer:.2f}%), saving best WER checkpoint...")
+                best_wer = valid_wer
+
+                save_best_wer_checkpoint(
+                    enc_to_save, dec_to_save, valid_wer, current_epoch, best_wer_checkpoint_path
+                )
+
+                # Log best WER to wandb
+                log_wandb({'best_wer': best_wer})
+
+            # Print sample predictions
+            if sample_preds:
+                print(f"  Sample Predictions: {sample_preds}")
+                print(f"  Original References: {sample_refs}")
+
+    # Cleanup
     if device_info['use_distributed']:
         cleanup_distributed()
 
@@ -452,7 +622,11 @@ def main_worker(rank, world_size, config, device_info):
         print(f"\n{'='*60}")
         print("Training completed!")
         print(f"Best validation loss: {best_loss:.4f}")
+        print(f"Best WER: {best_wer:.2f}%")
         print(f"{'='*60}")
+
+        # Finish wandb
+        finish_wandb()
 
 
 def main():

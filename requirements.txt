@@ -10,5 +10,11 @@ torchaudio>=2.0.0
 # Metrics
 torchmetrics>=1.0.0
 
+# Progress bar
+tqdm>=4.65.0
+
+# Logging (optional - enable in config with wandb.enabled: true)
+wandb>=0.15.0
+
 # Optional: For visualization
 # matplotlib>=3.5.0
