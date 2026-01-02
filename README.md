@@ -17,13 +17,13 @@ PyTorch implementation of [Conformer](https://arxiv.org/abs/2005.08100) model fo
 
 ### For NVIDIA GPUs:
 ```bash
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu<VERSION>
 pip install torchmetrics
 ```
 
 ### For AMD ROCm GPUs:
 ```bash
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm5.6
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm<VERSION>
 pip install torchmetrics
 ```
 
