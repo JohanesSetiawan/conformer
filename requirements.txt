@@ -2,13 +2,11 @@
 # Supports both NVIDIA CUDA and AMD ROCm
 
 # Core PyTorch (install appropriate version for your GPU)
-# For NVIDIA: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
-# For AMD ROCm: pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm5.6
-torch>=2.0.0
-torchaudio>=2.0.0
+# For NVIDIA: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu<VERSION>
+# For AMD ROCm: pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm<VERSION>
+# You can check on PyTorch Locally installation.
+torch
+torchaudio
 
 # Metrics
-torchmetrics>=1.0.0
-
-# Optional: For visualization
-# matplotlib>=3.5.0
+torchmetrics
