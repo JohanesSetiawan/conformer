@@ -6,16 +6,6 @@ import random
 import json
 from functools import lru_cache
 
-# Set torchaudio backend to avoid torchcodec/FFmpeg dependency issues
-# Try soundfile first (works without FFmpeg), fallback to sox_io
-try:
-    torchaudio.set_audio_backend("soundfile")
-except Exception:
-    try:
-        torchaudio.set_audio_backend("sox_io")
-    except Exception:
-        pass  # Use default backend
-
 class TextTransform:
   ''' Map characters to integers and vice versa '''
   def __init__(self):

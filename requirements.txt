@@ -10,8 +10,5 @@ torchaudio>=2.0.0
 # Metrics
 torchmetrics>=1.0.0
 
-# Audio backend (avoids FFmpeg/torchcodec dependency)
-soundfile>=0.12.0
-
 # Optional: For visualization
 # matplotlib>=3.5.0
