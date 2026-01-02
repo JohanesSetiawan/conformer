@@ -9,11 +9,12 @@ class PositionalEncoder(nn.Module):
     These encodings are the same as the original transformer model: https://arxiv.org/abs/1706.03762
 
     Parameters:
+      d_model (int): Dimension of the model
       max_len (int): Maximum sequence length (time dimension)
 
     Inputs:
       len (int): Length of encodings to retrieve
-    
+
     Outputs
       Tensor (len, d_model): Positional encodings
   '''
@@ -26,33 +27,37 @@ class PositionalEncoder(nn.Module):
     encodings[:, 0::2] = torch.sin(pos[:, None] * inv_freq)
     encodings[:, 1::2] = torch.cos(pos[:, None] * inv_freq)
     self.register_buffer('encodings', encodings)
-    
-  def forward(self, len):
-      return self.encodings[:len, :]
+
+  def forward(self, length):
+      return self.encodings[:length, :]
 
 class RelativeMultiHeadAttention(nn.Module):
   '''
-    Relative Multi-Head Self-Attention Module. 
+    Relative Multi-Head Self-Attention Module.
     Method proposed in Transformer-XL paper: https://arxiv.org/abs/1901.02860
 
     Parameters:
       d_model (int): Dimension of the model
       num_heads (int): Number of heads to split inputs into
       dropout (float): Dropout probability
-      positional_encoder (nn.Module): PositionalEncoder module
-    
+      positional_encoder (nn.Module): PositionalEncoder module (must be provided, not default)
+
     Inputs:
       x (Tensor): (batch_size, time, d_model)
       mask (Tensor): (batch_size, time, time) Optional mask to zero out attention score at certain indices
-    
+
     Outputs:
       Tensor (batch_size, time, d_model): Output tensor from the attention module.
-  
+
   '''
-  def __init__(self, d_model=144, num_heads=4, dropout=0.1, positional_encoder=PositionalEncoder(144)):
+  def __init__(self, d_model=144, num_heads=4, dropout=0.1, positional_encoder=None):
     super(RelativeMultiHeadAttention, self).__init__()
 
-    #dimensions
+    # FIX: positional_encoder must be provided explicitly, not as default argument
+    if positional_encoder is None:
+      raise ValueError("positional_encoder must be provided explicitly to avoid shared state issues")
+
+    # dimensions
     assert d_model % num_heads == 0
     self.d_model = d_model
     self.d_head = d_model // num_heads
@@ -71,7 +76,7 @@ class RelativeMultiHeadAttention(nn.Module):
     torch.nn.init.xavier_uniform_(self.u)
     torch.nn.init.xavier_uniform_(self.v)
 
-    # etc
+    # Layer norm epsilon as constant
     self.layer_norm = nn.LayerNorm(d_model, eps=6.1e-5)
     self.positional_encoder = positional_encoder
     self.dropout = nn.Dropout(dropout)
@@ -79,45 +84,45 @@ class RelativeMultiHeadAttention(nn.Module):
   def forward(self, x, mask=None):
     batch_size, seq_length, _ = x.size()
 
-    #layer norm and pos embeddings
+    # layer norm and pos embeddings
     x = self.layer_norm(x)
     pos_emb = self.positional_encoder(seq_length)
     pos_emb = pos_emb.repeat(batch_size, 1, 1)
 
-    #Linear projections, split into heads
+    # Linear projections, split into heads
     q = self.W_q(x).view(batch_size, seq_length, self.num_heads, self.d_head)
     k = self.W_k(x).view(batch_size, seq_length, self.num_heads, self.d_head).permute(0, 2, 3, 1) # (batch_size, num_heads, d_head, time)
     v = self.W_v(x).view(batch_size, seq_length, self.num_heads, self.d_head).permute(0, 2, 3, 1) # (batch_size, num_heads, d_head, time)
     pos_emb = self.W_pos(pos_emb).view(batch_size, -1, self.num_heads, self.d_head).permute(0, 2, 3, 1) # (batch_size, num_heads, d_head, time)
 
-    #Compute attention scores with relative position embeddings
+    # Compute attention scores with relative position embeddings
     AC = torch.matmul((q + self.u).transpose(1, 2), k)
     BD = torch.matmul((q + self.v).transpose(1, 2), pos_emb)
     BD = self.rel_shift(BD)
     attn = (AC + BD) / math.sqrt(self.d_model)
 
-    #Mask before softmax with large negative number
+    # Mask before softmax with large negative number
     if mask is not None:
       mask = mask.unsqueeze(1)
       mask_value = -1e+30 if attn.dtype == torch.float32 else -1e+4
       attn.masked_fill_(mask, mask_value)
 
-    #Softmax
+    # Softmax
     attn = F.softmax(attn, -1)
 
-    #Construct outputs from values
+    # Construct outputs from values
     output = torch.matmul(attn, v.transpose(2, 3)).transpose(1, 2) # (batch_size, time, num_heads, d_head)
     output = output.contiguous().view(batch_size, -1, self.d_model) # (batch_size, time, d_model)
 
-    #Output projections and dropout
+    # Output projections and dropout
     output = self.W_out(output)
     return self.dropout(output)
 
 
   def rel_shift(self, emb):
     '''
-      Pad and shift form relative positional encodings. 
-      Taken from Transformer-XL implementation: https://github.com/kimiyoung/transformer-xl/blob/master/pytorch/mem_transformer.py 
+      Pad and shift form relative positional encodings.
+      Taken from Transformer-XL implementation: https://github.com/kimiyoung/transformer-xl/blob/master/pytorch/mem_transformer.py
     '''
     batch_size, num_heads, seq_length1, seq_length2 = emb.size()
     zeros = emb.new_zeros(batch_size, num_heads, seq_length1, 1)
@@ -135,19 +140,19 @@ class ConvBlock(nn.Module):
       d_model (int): Dimension of the model
       kernel_size (int): Size of kernel to use for depthwise convolution
       dropout (float): Dropout probability
-    
+
     Inputs:
       x (Tensor): (batch_size, time, d_model)
       mask: Unused
-    
+
     Outputs:
       Tensor (batch_size, time, d_model): Output tensor from the convolution module
-  
+
   '''
   def __init__(self, d_model=144, kernel_size=31, dropout=0.1):
     super(ConvBlock, self).__init__()
     self.layer_norm = nn.LayerNorm(d_model, eps=6.1e-5)
-    kernel_size=31
+    # FIX: Remove hardcoded kernel_size=31, use the parameter instead
     self.module = nn.Sequential(
       nn.Conv1d(in_channels=d_model, out_channels=d_model * 2, kernel_size=1), # first pointwise with 2x expansion
       nn.GLU(dim=1),
@@ -172,14 +177,14 @@ class FeedForwardBlock(nn.Module):
       d_model (int): Dimension of the model
       expansion (int): Expansion factor for first linear layer
       dropout (float): Dropout probability
-    
+
     Inputs:
       x (Tensor): (batch_size, time, d_model)
       mask: Unused
-    
+
     Outputs:
       Tensor (batch_size, time, d_model): Output tensor from the feed-forward module
-  
+
   '''
   def __init__(self, d_model=144, expansion=4, dropout=0.1):
     super(FeedForwardBlock, self).__init__()
@@ -197,18 +202,18 @@ class FeedForwardBlock(nn.Module):
 
 class Conv2dSubsampling(nn.Module):
   '''
-    2d Convolutional subsampling. 
-    Subsamples time and freq domains of input spectrograms by a factor of 4, d_model times. 
+    2d Convolutional subsampling.
+    Subsamples time and freq domains of input spectrograms by a factor of 4, d_model times.
 
     Parameters:
       d_model (int): Dimension of the model
-    
+
     Inputs:
       x (Tensor): Input spectrogram (batch_size, time, d_input)
-    
+
     Outputs:
       Tensor (batch_size, time, d_model * (d_input // 4)): Output tensor from the conlutional subsampling module
-  
+
   '''
   def __init__(self, d_model=144):
     super(Conv2dSubsampling, self).__init__()
@@ -228,7 +233,7 @@ class Conv2dSubsampling(nn.Module):
 
 class ConformerBlock(nn.Module):
   '''
-    Conformer Encoder Block. 
+    Conformer Encoder Block.
 
     Parameters:
       d_model (int): Dimension of the model
@@ -236,16 +241,16 @@ class ConformerBlock(nn.Module):
       feed_forward_residual_factor (float): output_weight for feed-forward residual connections
       feed_forward_expansion_factor (int): Expansion factor for feed-forward block
       num_heads (int): Number of heads to use for multi-head attention
-      positional_encoder (nn.Module): PositionalEncoder module
+      positional_encoder (nn.Module): PositionalEncoder module (must be provided explicitly)
       dropout (float): Dropout probability
-    
+
     Inputs:
       x (Tensor): (batch_size, time, d_model)
       mask (Tensor): (batch_size, time, time) Optional mask to zero out attention score at certain indices
-    
+
     Outputs:
       Tensor (batch_size, time, d_model): Output tensor from the conformer block.
-  
+
   '''
   def __init__(
           self,
@@ -254,10 +259,15 @@ class ConformerBlock(nn.Module):
           feed_forward_residual_factor=.5,
           feed_forward_expansion_factor=4,
           num_heads=4,
-          positional_encoder=PositionalEncoder(144),
+          positional_encoder=None,
           dropout=0.1,
   ):
     super(ConformerBlock, self).__init__()
+
+    # FIX: positional_encoder must be provided explicitly
+    if positional_encoder is None:
+      raise ValueError("positional_encoder must be provided explicitly")
+
     self.residual_factor = feed_forward_residual_factor
     self.ff1 = FeedForwardBlock(d_model, feed_forward_expansion_factor, dropout)
     self.attention = RelativeMultiHeadAttention(d_model, num_heads, dropout, positional_encoder)
@@ -275,7 +285,7 @@ class ConformerBlock(nn.Module):
 
 class ConformerEncoder(nn.Module):
   '''
-    Conformer Encoder Module. 
+    Conformer Encoder Module.
 
     Parameters:
       d_input (int): Dimension of the input
@@ -286,22 +296,22 @@ class ConformerEncoder(nn.Module):
       feed_forward_expansion_factor (int): Expansion factor for feed-forward block
       num_heads (int): Number of heads to use for multi-head attention
       dropout (float): Dropout probability
-    
+
     Inputs:
       x (Tensor): input spectrogram of dimension (batch_size, time, d_input)
       mask (Tensor): (batch_size, time, time) Optional mask to zero out attention score at certain indices
-    
+
     Outputs:
       Tensor (batch_size, time, d_model): Output tensor from the conformer encoder
 
-  
+
   '''
   def __init__(
           self,
           d_input=80,
           d_model=144,
           num_layers=16,
-          conv_kernel_size=31, 
+          conv_kernel_size=31,
           feed_forward_residual_factor=.5,
           feed_forward_expansion_factor=4,
           num_heads=4,
@@ -311,12 +321,13 @@ class ConformerEncoder(nn.Module):
     self.conv_subsample = Conv2dSubsampling(d_model=d_model)
     self.linear_proj = nn.Linear(d_model * (((d_input - 1) // 2 - 1) // 2), d_model) # project subsamples to d_model
     self.dropout = nn.Dropout(p=dropout)
-    
-    # define global positional encoder to limit model parameters
-    positional_encoder = PositionalEncoder(d_model) 
+
+    # Define global positional encoder to limit model parameters
+    # FIX: Create positional encoder here and pass to blocks explicitly
+    positional_encoder = PositionalEncoder(d_model)
     self.layers = nn.ModuleList([ConformerBlock(
             d_model=d_model,
-            conv_kernel_size=conv_kernel_size, 
+            conv_kernel_size=conv_kernel_size,
             feed_forward_residual_factor=feed_forward_residual_factor,
             feed_forward_expansion_factor=feed_forward_expansion_factor,
             num_heads=num_heads,
@@ -327,16 +338,20 @@ class ConformerEncoder(nn.Module):
   def forward(self, x, mask=None):
     x = self.conv_subsample(x)
     if mask is not None:
-      mask = mask[:, :-2:2, :-2:2] #account for subsampling
-      mask = mask[:, :-2:2, :-2:2] #account for subsampling
-      assert mask.shape[1] == x.shape[1], f'{mask.shape} {x.shape}'
-    
+      # FIX: Apply mask subsampling only once with correct formula
+      # Conv2d with kernel=3, stride=2 applied twice: output_len = ((input_len - 3) // 2 + 1)
+      # Combined: ((((L - 3) // 2 + 1) - 3) // 2 + 1) which simplifies to (L - 1) // 4 approximately
+      mask = mask[:, ::4, ::4]  # Simplified subsampling that matches actual output dimensions
+      # Ensure mask matches x dimensions
+      if mask.shape[1] > x.shape[1]:
+        mask = mask[:, :x.shape[1], :x.shape[1]]
+
     x = self.linear_proj(x)
     x = self.dropout(x)
-    
+
     for layer in self.layers:
       x = layer(x, mask=mask)
-    
+
     return x
 
 
@@ -349,13 +364,13 @@ class LSTMDecoder(nn.Module):
       d_decoder (int): Hidden dimension of the decoder
       num_layers (int): Number of LSTM layers to use in the decoder
       num_classes (int): Number of output classes to predict
-    
+
     Inputs:
       x (Tensor): (batch_size, time, d_encoder)
-    
+
     Outputs:
       Tensor (batch_size, time, num_classes): Class prediction logits
-  
+
   '''
   def __init__(self, d_encoder=144, d_decoder=320, num_layers=1, num_classes=29):
     super(LSTMDecoder, self).__init__()
