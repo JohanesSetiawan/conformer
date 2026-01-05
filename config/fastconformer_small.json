@@ -1,0 +1,48 @@
+{
+  "name": "FastConformer-Transducer Small",
+  "description": "Small FastConformer for resource-constrained environments",
+
+  "model": {
+    "d_input": 80,
+    "vocab_size": 29,
+    "d_encoder": 256,
+    "d_predictor": 256,
+    "d_joint": 320,
+    "encoder_layers": 12,
+    "encoder_heads": 4,
+    "encoder_conv_kernel": 9,
+    "encoder_ff_expansion": 4,
+    "predictor_layers": 2,
+    "predictor_kernel": 2,
+    "dropout": 0.1,
+    "subsampling_channels": 256
+  },
+
+  "data": {
+    "dataset": "librispeech",
+    "data_root": "./data",
+    "train_subset": "train-clean-100",
+    "val_subset": "dev-clean",
+    "sample_rate": 16000,
+    "download": true
+  },
+
+  "training": {
+    "epochs": 100,
+    "batch_size": 8,
+    "num_workers": 4,
+    "lr": 0.001,
+    "weight_decay": 1e-6,
+    "lr_multiplier": 5,
+    "warmup_steps": 10000,
+    "grad_clip": 1.0,
+    "use_amp": true,
+    "checkpoint_dir": "./checkpoints/fastconformer_small"
+  },
+
+  "wandb": {
+    "enabled": false,
+    "project": "fastconformer-transducer",
+    "run_name": "fastconformer-small"
+  }
+}

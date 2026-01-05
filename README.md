@@ -1,148 +1,237 @@
-# Conformer ASR
+# FastConformer-Transducer ASR
 
-PyTorch implementation of [Conformer](https://arxiv.org/abs/2005.08100) model for end-to-end speech recognition on the LibriSpeech dataset.
+A streaming-capable, memory-efficient Automatic Speech Recognition (ASR) model based on FastConformer encoder and Transducer decoder.
 
-## Features
+## Architecture
 
-- JSON-based configuration system
-- Multi-GPU support (auto-detected)
-- AMD ROCm GPU support (MI300X, etc.)
-- NVIDIA CUDA GPU support
-- Mixed precision training (FP16/BF16)
-- Memory-efficient training with gradient accumulation
-- Smart batching for optimal performance
-- Gradient clipping for training stability
+This implementation is based on NVIDIA's FastConformer research with the following key features:
 
-## Installation
+- **FastConformer Encoder**: 8x subsampling for efficient attention computation
+- **Depthwise Separable Convolutions**: Reduced compute with similar accuracy
+- **Stateless Predictor**: Conv1D-based predictor (no LSTM state management)
+- **RNN-T Loss**: Transducer-based training for streaming capability
+- **Streaming Support**: Real-time transcription with configurable latency
 
-### For NVIDIA GPUs:
+### Key Optimizations
+
+| Feature | Original Conformer | FastConformer |
+|---------|-------------------|---------------|
+| Subsampling | 4x | 8x |
+| Conv Kernel | 31 | 9 |
+| Convolutions | Standard | Depthwise Separable |
+| Predictor | LSTM | Stateless Conv1D |
+
+## Requirements
+
+### System Dependencies
+
+FFmpeg is required for audio loading:
+
 ```bash
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu<VERSION>
-pip install torchmetrics
+# Ubuntu/Debian
+sudo apt update && sudo apt install ffmpeg
+
+# macOS
+brew install ffmpeg
+
+# Windows
+# Download from https://ffmpeg.org/download.html
 ```
 
-### For AMD ROCm GPUs:
+### Python Dependencies
+
 ```bash
+# For NVIDIA GPU
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu<VERSION>
+pip install -r requirements.txt
+
+# For AMD GPU (ROCm)
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm<VERSION>
-pip install torchmetrics
+pip install -r requirements.txt
+
+# For CPU only
+pip install torch torchaudio
+pip install -r requirements.txt
+
+# You can check on PyTorch Locally installation page for the latest version.
 ```
 
 ## Usage
 
-### Train with a config file:
+### Training
+
 ```bash
-python train.py --config config/conformer_small.json
+# Train with small config (LibriSpeech train-clean-100)
+python train.py --config config/fastconformer_small.json
+
+# Resume training from checkpoint
+python train.py --config config/fastconformer_small.json --resume
+
+# Train with medium config (LibriSpeech train-clean-360)
+python train.py --config config/fastconformer_medium.json
+
+# Train with LJSpeech dataset
+python train.py --config config/fastconformer_ljspeech.json
 ```
 
-### Available configurations:
+### Inference
 
-| Config File | Model Size | Parameters | Recommended GPU |
-|-------------|------------|------------|-----------------|
-| `config/conformer_ultra_small.json` | Ultra Small | ~2M | Any GPU / CPU |
-| `config/conformer_small.json` | Small (S) | ~10M | 8GB+ VRAM |
-| `config/conformer_medium.json` | Medium (M) | ~30M | 16GB+ VRAM |
-| `config/conformer_large.json` | Large (L) | ~118M | 40GB+ VRAM |
-
-### Example: Train Conformer Small
 ```bash
-python train.py --config config/conformer_small.json
-```
+# Offline transcription (full-context)
+python inference.py --config config/fastconformer_small.json --audio audio.wav
 
-### Example: Train on AMD MI300X
-```bash
-# ROCm is automatically detected
-python train.py --config config/conformer_medium.json
+# Streaming transcription (real-time)
+python inference.py --config config/fastconformer_small.json --audio audio.wav --streaming
+
+# With beam search decoding
+python inference.py --config config/fastconformer_small.json --audio audio.wav --beam-size 5
+
+# Show partial results during streaming
+python inference.py --config config/fastconformer_small.json --audio audio.wav --streaming --show-partial
 ```
 
 ## Configuration
 
-All training parameters are controlled via JSON config files. Example config structure:
+All configurations are JSON-based and located in the `config/` folder:
+
+| Config | Encoder Dim | Layers | Params | Dataset |
+|--------|-------------|--------|--------|---------|
+| `fastconformer_small.json` | 256 | 12 | ~20M | LibriSpeech 100h |
+| `fastconformer_medium.json` | 384 | 16 | ~50M | LibriSpeech 360h |
+| `fastconformer_large.json` | 512 | 18 | ~90M | LibriSpeech 500h |
+| `fastconformer_ljspeech.json` | 256 | 12 | ~20M | LJSpeech |
+
+### Configuration Options
 
 ```json
 {
   "model": {
-    "name": "conformer_small",
-    "d_input": 80,
-    "d_encoder": 144,
-    "d_decoder": 320,
-    "encoder_layers": 16,
-    "decoder_layers": 1,
-    "attention_heads": 4,
-    "conv_kernel_size": 31,
-    "feed_forward_expansion_factor": 4,
-    "feed_forward_residual_factor": 0.5,
-    "dropout": 0.1,
-    "num_classes": 29
-  },
-  "training": {
-    "epochs": 50,
-    "batch_size": 16,
-    "accumulate_iters": 2,
-    "warmup_steps": 10000,
-    "weight_decay": 1e-6,
-    "variational_noise_std": 0.0001,
-    "gradient_clip_value": 1.0,
-    "use_amp": true,
-    "report_freq": 100
+    "d_input": 80,           // Mel spectrogram features
+    "vocab_size": 29,        // A-Z + apostrophe + space + blank
+    "d_encoder": 256,        // Encoder hidden dimension
+    "d_predictor": 256,      // Predictor hidden dimension
+    "d_joint": 320,          // Joint network dimension
+    "encoder_layers": 12,    // Number of encoder layers
+    "encoder_heads": 4,      // Attention heads
+    "encoder_conv_kernel": 9,// Convolution kernel size
+    "dropout": 0.1           // Dropout rate
   },
   "data": {
-    "data_dir": "./data",
-    "train_set": "train-clean-100",
-    "test_set": "test-clean",
-    "num_workers": 4,
-    "smart_batch": true
+    "dataset": "librispeech", // or "ljspeech"
+    "sample_rate": 16000
   },
-  "checkpoint": {
-    "checkpoint_path": "checkpoints/conformer_small_best.pt",
-    "save_dir": "checkpoints",
-    "load_checkpoint": false
+  "training": {
+    "epochs": 100,
+    "batch_size": 8,
+    "warmup_steps": 10000,
+    "grad_clip": 1.0,
+    "use_amp": true           // Mixed precision training
   },
-  "hardware": {
-    "distributed": "auto",
-    "mixed_precision": true,
-    "memory_efficient": true
+  "wandb": {
+    "enabled": false,         // Set to true to enable logging
+    "project": "fastconformer-transducer"
   }
 }
 ```
 
-### Hardware Configuration Options
+## Features
 
-- `distributed`: `"auto"` (detect GPUs), `"single"` (force single GPU), `"multi"` (force multi-GPU)
-- `mixed_precision`: Enable FP16/BF16 training
-- `memory_efficient`: Enable memory optimizations
+### Multi-GPU Training
+
+Multi-GPU training is automatically enabled when multiple GPUs are detected:
+
+```bash
+# Uses all available GPUs automatically
+python train.py --config config/fastconformer_medium.json
+```
+
+### AMD ROCm Support
+
+Full support for AMD GPUs via ROCm. Install PyTorch with ROCm backend:
+
+```bash
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm<VERSION>
+```
+
+### Weights & Biases Logging
+
+Enable W&B logging in the config:
+
+```json
+{
+  "wandb": {
+    "enabled": true,
+    "project": "your-project-name",
+    "run_name": "experiment-1"
+  }
+}
+```
+
+### Checkpointing
+
+The training script maintains two checkpoints:
+- `checkpoint.pt`: Latest checkpoint for resuming training
+- `best_model.pt`: Best model based on validation WER
 
 ## Model Variants
 
-| Variant | d_encoder | Layers | Attention Heads | Parameters |
-|---------|-----------|--------|-----------------|------------|
-| Ultra Small | 64 | 4 | 2 | ~2M |
-| Small (S) | 144 | 16 | 4 | ~10M |
-| Medium (M) | 256 | 16 | 4 | ~30M |
-| Large (L) | 512 | 17 | 8 | ~118M |
+### Small (~20M parameters)
+- Suitable for edge devices and real-time applications
+- ~50ms inference latency on modern GPUs
+- Target WER: ~10% on LibriSpeech test-clean
 
-## Memory Optimization Tips
+### Medium (~50M parameters)
+- Balanced accuracy and speed
+- Good for server deployments
+- Target WER: ~6% on LibriSpeech test-clean
 
-1. **Reduce batch size**: Use smaller batch_size with larger accumulate_iters
-2. **Disable smart batching**: Set `"smart_batch": false` for large datasets
-3. **Use mixed precision**: Set `"use_amp": true`
-4. **Reduce num_workers**: Lower values use less RAM
+### Large (~90M parameters)
+- Maximum accuracy
+- Best for offline transcription
+- Target WER: ~4% on LibriSpeech test-clean
+
+## Streaming Mode
+
+The streaming mode processes audio in chunks with configurable latency:
+
+```python
+from inference import StreamingTranscriber
+from model import create_model
+from utils import load_config, get_text_transform
+
+config = load_config('config/fastconformer_small.json')
+model = create_model(config)
+# Load checkpoint...
+
+transcriber = StreamingTranscriber(
+    model,
+    get_text_transform(),
+    device,
+    chunk_size_ms=160,  # 160ms chunks
+    lookahead_ms=80,    # 80ms lookahead
+)
+
+# Process audio chunks in real-time
+for chunk in audio_stream:
+    text = transcriber.process_chunk(chunk)
+    if text:
+        print(text, end='', flush=True)
+
+# Finalize
+final = transcriber.finalize()
+```
 
 ## Supported Datasets
 
-Uses torchaudio's [LibriSpeech dataset](https://pytorch.org/audio/stable/datasets.html):
-- `train-clean-100`
-- `train-clean-360`
-- `train-other-500`
-- `dev-clean`
-- `dev-other`
-- `test-clean`
-- `test-other`
+- **LibriSpeech**: train-clean-100, train-clean-360, train-other-500, dev-clean, dev-other, test-clean, test-other
+- **LJSpeech**: Single speaker audiobook dataset
 
-## Other Implementations
-- https://github.com/sooftware/conformer
-- https://github.com/lucidrains/conformer
+## References
 
-## TODO
-- Language Model (LM) implementation
-- Support for other decoders (transformer decoder, etc.)
-- Inference script for production use
+- [FastConformer (NVIDIA)](https://research.nvidia.com/labs/conv-ai/blogs/2023/2023-06-07-fast-conformer/)
+- [Conformer: Convolution-augmented Transformer for Speech Recognition](https://arxiv.org/abs/2005.08100)
+- [RNN Transducer](https://arxiv.org/abs/1211.3711)
+
+## License
+
+MIT License - See [LICENSE](LICENSE) for details.

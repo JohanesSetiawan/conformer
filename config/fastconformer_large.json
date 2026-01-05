@@ -1,0 +1,48 @@
+{
+  "name": "FastConformer-Transducer Large",
+  "description": "Large FastConformer for maximum accuracy",
+
+  "model": {
+    "d_input": 80,
+    "vocab_size": 29,
+    "d_encoder": 512,
+    "d_predictor": 384,
+    "d_joint": 640,
+    "encoder_layers": 18,
+    "encoder_heads": 8,
+    "encoder_conv_kernel": 9,
+    "encoder_ff_expansion": 4,
+    "predictor_layers": 2,
+    "predictor_kernel": 2,
+    "dropout": 0.1,
+    "subsampling_channels": 256
+  },
+
+  "data": {
+    "dataset": "librispeech",
+    "data_root": "./data",
+    "train_subset": "train-other-500",
+    "val_subset": "dev-other",
+    "sample_rate": 16000,
+    "download": true
+  },
+
+  "training": {
+    "epochs": 150,
+    "batch_size": 16,
+    "num_workers": 4,
+    "lr": 0.001,
+    "weight_decay": 1e-6,
+    "lr_multiplier": 5,
+    "warmup_steps": 40000,
+    "grad_clip": 1.0,
+    "use_amp": true,
+    "checkpoint_dir": "./checkpoints/fastconformer_large"
+  },
+
+  "wandb": {
+    "enabled": false,
+    "project": "fastconformer-transducer",
+    "run_name": "fastconformer-large"
+  }
+}
