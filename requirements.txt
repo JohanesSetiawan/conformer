@@ -1,10 +1,10 @@
-# Conformer ASR Requirements
+# FastConformer-Transducer ASR Requirements
 # Supports both NVIDIA CUDA and AMD ROCm
 
 # Core PyTorch (install appropriate version for your GPU)
 # For NVIDIA: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu<VERSION>
 # For AMD ROCm: pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm<VERSION>
-# You can check on PyTorch Locally installation.
+# You can check on PyTorch Locally installation page for the latest version.
 torch
 torchaudio
 torchcodec
@@ -14,4 +14,16 @@ torchmetrics
 wandb
 
 # Progress bar
-tqdm
+tqdm>=4.65.0
+
+# Logging (optional - enable in config with wandb.enabled: true)
+wandb>=0.15.0
+
+# Note: FFmpeg is required for audio loading
+# Install via system package manager:
+#   Ubuntu/Debian: sudo apt install ffmpeg
+#   macOS: brew install ffmpeg
+#   Windows: Download from https://ffmpeg.org/download.html
+
+# Optional: For visualization
+# matplotlib>=3.5.0

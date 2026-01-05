@@ -1,675 +1,629 @@
-#!/usr/bin/env python3
 """
-Conformer ASR Training Script
+FastConformer-Transducer Training Script
 
-Usage:
-  python train.py --config config/conformer_small.json
-
-Supports:
-  - NVIDIA CUDA GPUs
-  - AMD ROCm GPUs (MI300X, etc.)
-  - Multi-GPU training (auto-detected)
-  - Mixed precision training
-  - Memory-efficient training
-  - Weights & Biases logging
+Features:
+- RNN-T loss training
+- tqdm progress bars
+- Weights & Biases logging (optional)
+- Dual checkpointing (resume + best WER)
+- Multi-GPU training (DDP)
+- Mixed precision training (AMP)
+- Support for LibriSpeech and LJSpeech datasets
 """
 
 import os
-import gc
+import sys
 import argparse
-import random
-import torchaudio
+import json
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
-from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.cuda.amp import autocast, GradScaler
-from tqdm.auto import tqdm
+from torch.amp import autocast, GradScaler
+import torchaudio
+from tqdm import tqdm
+from torchmetrics.text import WordErrorRate, CharErrorRate
 
-from model import ConformerEncoder, LSTMDecoder
+from model import FastConformerTransducer, create_model, model_size
 from utils import (
-    load_config,
     get_device_info,
     setup_distributed,
     cleanup_distributed,
-    get_sorted_indices_lazy,
-    BatchSampler,
-    MemoryEfficientBatchSampler,
-    preprocess_example,
+    load_config,
     TransformerLrScheduler,
-    GreedyCharacterDecoder,
-    AvgMeter,
-    model_size,
-    add_model_noise,
-    load_checkpoint,
-    save_checkpoint,
-    get_text_transform,
     clear_memory,
+    get_text_transform,
+    AvgMeter,
 )
 
-# Only argparse for config selection
-parser = argparse.ArgumentParser("conformer")
-parser.add_argument('--config', type=str, required=True, help='Path to JSON config file')
-args = parser.parse_args()
 
-# Global wandb run (initialized later if enabled)
-wandb_run = None
+def get_audio_transforms(sample_rate: int = 16000, n_mels: int = 80, training: bool = True):
+    """Get audio transforms for mel spectrogram generation with SpecAugment."""
+    hop_length = sample_rate // 100  # 10ms hop
 
-
-def init_wandb(config, device_info):
-    """Initialize Weights & Biases if enabled in config."""
-    global wandb_run
-
-    if not config.get('wandb', {}).get('enabled', False):
-        return None
-
-    try:
-        import wandb
-
-        wandb_config = config.get('wandb', {})
-        project_name = wandb_config.get('project', 'conformer-asr')
-        run_name = wandb_config.get('run_name', config['model']['name'])
-
-        wandb_run = wandb.init(
-            project=project_name,
-            name=run_name,
-            config={
-                'model': config['model'],
-                'training': config['training'],
-                'data': config['data'],
-                'hardware': config.get('hardware', {}),
-                'device': device_info['device_name'],
-            },
-            reinit=True,
-        )
-        print(f"Weights & Biases initialized: {wandb_run.url}")
-        return wandb_run
-    except ImportError:
-        print("Warning: wandb not installed. Install with: pip install wandb")
-        return None
-    except Exception as e:
-        print(f"Warning: Failed to initialize wandb: {e}")
-        return None
-
-
-def log_wandb(metrics, step=None):
-    """Log metrics to wandb if enabled."""
-    global wandb_run
-    if wandb_run is not None:
-        try:
-            import wandb
-            wandb.log(metrics, step=step)
-        except Exception:
-            pass
-
-
-def finish_wandb():
-    """Finish wandb run."""
-    global wandb_run
-    if wandb_run is not None:
-        try:
-            import wandb
-            wandb.finish()
-        except Exception:
-            pass
-
-
-def create_dataloaders(config, device_info, rank=0, world_size=1):
-    """Create train and test dataloaders with memory-efficient options."""
-    data_config = config['data']
-    training_config = config['training']
-
-    # Load datasets
-    if not os.path.isdir(data_config['data_dir']):
-        os.makedirs(data_config['data_dir'], exist_ok=True)
-
-    print(f"Loading training data: {data_config['train_set']}...")
-    train_data = torchaudio.datasets.LIBRISPEECH(
-        root=data_config['data_dir'],
-        url=data_config['train_set'],
-        download=True
-    )
-
-    print(f"Loading test data: {data_config['test_set']}...")
-    test_data = torchaudio.datasets.LIBRISPEECH(
-        data_config['data_dir'],
-        url=data_config['test_set'],
-        download=True
-    )
-
-    # Determine batch sampler strategy
-    if data_config.get('smart_batch', True):
-        print('Using smart batching for efficient training...')
-        # Use memory-efficient sorting
-        sorted_train_inds = get_sorted_indices_lazy(train_data)
-        sorted_test_inds = get_sorted_indices_lazy(test_data)
-
-        train_batch_sampler = BatchSampler(sorted_train_inds, batch_size=training_config['batch_size'])
-        test_batch_sampler = BatchSampler(sorted_test_inds, batch_size=training_config['batch_size'])
-
-        train_loader = DataLoader(
-            dataset=train_data,
-            pin_memory=data_config.get('pin_memory', True) if device_info['device'] != 'cpu' else False,
-            num_workers=data_config.get('num_workers', 2),
-            batch_sampler=train_batch_sampler,
-            collate_fn=lambda x: preprocess_example(x, 'train'),
-            prefetch_factor=data_config.get('prefetch_factor', 2) if data_config.get('num_workers', 2) > 0 else None,
-        )
-
-        test_loader = DataLoader(
-            dataset=test_data,
-            pin_memory=data_config.get('pin_memory', True) if device_info['device'] != 'cpu' else False,
-            num_workers=data_config.get('num_workers', 2),
-            batch_sampler=test_batch_sampler,
-            collate_fn=lambda x: preprocess_example(x, 'valid'),
-            prefetch_factor=data_config.get('prefetch_factor', 2) if data_config.get('num_workers', 2) > 0 else None,
+    if training:
+        # Training with SpecAugment
+        time_masks = [
+            torchaudio.transforms.TimeMasking(time_mask_param=15, p=0.05)
+            for _ in range(10)
+        ]
+        transform = nn.Sequential(
+            torchaudio.transforms.MelSpectrogram(
+                sample_rate=sample_rate,
+                n_mels=n_mels,
+                hop_length=hop_length,
+            ),
+            torchaudio.transforms.FrequencyMasking(freq_mask_param=27),
+            *time_masks,
         )
     else:
-        # Standard dataloader without smart batching
-        train_loader = DataLoader(
-            dataset=train_data,
-            pin_memory=data_config.get('pin_memory', True) if device_info['device'] != 'cpu' else False,
-            num_workers=data_config.get('num_workers', 2),
-            batch_size=training_config['batch_size'],
-            shuffle=True,
-            collate_fn=lambda x: preprocess_example(x, 'train'),
-            prefetch_factor=data_config.get('prefetch_factor', 2) if data_config.get('num_workers', 2) > 0 else None,
+        # Validation without augmentation
+        transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_mels=n_mels,
+            hop_length=hop_length,
         )
 
-        test_loader = DataLoader(
-            dataset=test_data,
-            pin_memory=data_config.get('pin_memory', True) if device_info['device'] != 'cpu' else False,
-            num_workers=data_config.get('num_workers', 2),
-            batch_size=training_config['batch_size'],
-            shuffle=False,
-            collate_fn=lambda x: preprocess_example(x, 'valid'),
-            prefetch_factor=data_config.get('prefetch_factor', 2) if data_config.get('num_workers', 2) > 0 else None,
+    return transform
+
+
+class TransducerDataset(torch.utils.data.Dataset):
+    """Dataset wrapper for Transducer training."""
+
+    def __init__(
+        self,
+        dataset,
+        text_transform,
+        audio_transform,
+        target_sample_rate: int = 16000,
+        dataset_type: str = "librispeech",
+    ):
+        self.dataset = dataset
+        self.text_transform = text_transform
+        self.audio_transform = audio_transform
+        self.target_sample_rate = target_sample_rate
+        self.dataset_type = dataset_type
+
+        # Resampler cache
+        self._resamplers = {}
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _get_resampler(self, orig_sr: int) -> torchaudio.transforms.Resample:
+        """Get cached resampler for a given sample rate."""
+        if orig_sr not in self._resamplers:
+            self._resamplers[orig_sr] = torchaudio.transforms.Resample(
+                orig_freq=orig_sr,
+                new_freq=self.target_sample_rate,
+            )
+        return self._resamplers[orig_sr]
+
+    def __getitem__(self, idx):
+        if self.dataset_type == "librispeech":
+            waveform, sample_rate, utterance, _, _, _ = self.dataset[idx]
+        elif self.dataset_type == "ljspeech":
+            waveform, sample_rate, _, utterance = self.dataset[idx]
+        else:
+            raise ValueError(f"Unknown dataset type: {self.dataset_type}")
+
+        # Resample if necessary
+        if sample_rate != self.target_sample_rate:
+            resampler = self._get_resampler(sample_rate)
+            waveform = resampler(waveform)
+
+        # Convert to mel spectrogram
+        mel = self.audio_transform(waveform).squeeze(0).transpose(0, 1)  # (time, n_mels)
+
+        # Convert text to token indices
+        tokens = torch.tensor(
+            self.text_transform.text_to_int(utterance.upper()),
+            dtype=torch.long,
         )
 
-    return train_loader, test_loader
+        return mel, tokens, utterance
 
 
-def create_model(config, device):
-    """Create encoder and decoder models."""
-    model_config = config['model']
+def collate_fn(batch):
+    """Collate function for DataLoader."""
+    mels, tokens, utterances = zip(*batch)
 
-    encoder = ConformerEncoder(
-        d_input=model_config['d_input'],
-        d_model=model_config['d_encoder'],
-        num_layers=model_config['encoder_layers'],
-        conv_kernel_size=model_config['conv_kernel_size'],
-        dropout=model_config['dropout'],
-        feed_forward_residual_factor=model_config['feed_forward_residual_factor'],
-        feed_forward_expansion_factor=model_config['feed_forward_expansion_factor'],
-        num_heads=model_config['attention_heads'],
-    )
+    # Get lengths before padding
+    mel_lengths = torch.tensor([m.size(0) for m in mels], dtype=torch.long)
+    token_lengths = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
 
-    decoder = LSTMDecoder(
-        d_encoder=model_config['d_encoder'],
-        d_decoder=model_config['d_decoder'],
-        num_layers=model_config['decoder_layers'],
-        num_classes=model_config.get('num_classes', 29),
-    )
+    # Pad sequences
+    mels_padded = nn.utils.rnn.pad_sequence(mels, batch_first=True)
+    tokens_padded = nn.utils.rnn.pad_sequence(tokens, batch_first=True)
 
-    # Move to device
-    encoder = encoder.to(device)
-    decoder = decoder.to(device)
-
-    return encoder, decoder
+    return mels_padded, mel_lengths, tokens_padded, token_lengths, utterances
 
 
-def train_epoch(encoder, decoder, char_decoder, optimizer, scheduler, criterion,
-                grad_scaler, train_loader, config, device, device_info, epoch):
-    """Run a single training epoch with memory optimizations."""
-    from torchmetrics.text.wer import WordErrorRate
+def greedy_decode(model, encoder_out, max_symbols: int = 100):
+    """Greedy decoding for Transducer model."""
+    batch_size, T, _ = encoder_out.size()
+    device = encoder_out.device
 
-    training_config = config['training']
-    hardware_config = config.get('hardware', {})
+    # Initialize
+    blank_id = model.blank_id
+    decoded = [[] for _ in range(batch_size)]
+
+    for b in range(batch_size):
+        # Start with blank
+        y = torch.zeros(1, 1, dtype=torch.long, device=device)
+        predictor_out = model.predict(y)
+
+        for t in range(T):
+            enc_t = encoder_out[b:b+1, t:t+1, :]  # (1, 1, d_encoder)
+
+            for _ in range(max_symbols):
+                logits = model.joint_step(enc_t, predictor_out)  # (1, vocab_size)
+                pred = logits.argmax(dim=-1).item()
+
+                if pred == blank_id:
+                    break
+
+                decoded[b].append(pred)
+
+                # Update predictor state
+                y = torch.tensor([[pred]], dtype=torch.long, device=device)
+                pred_out = model.predict(y)
+                predictor_out = pred_out
+
+    return decoded
+
+
+def validate(model, val_loader, device, text_transform, rank=0):
+    """Validate model and compute WER."""
+    model.eval()
 
     wer_metric = WordErrorRate()
-    error_rate = AvgMeter()
-    avg_loss = AvgMeter()
-    text_transform = get_text_transform()
+    cer_metric = CharErrorRate()
 
-    encoder.train()
-    decoder.train()
-
-    accumulate_iters = training_config.get('accumulate_iters', 1)
-    gradient_clip_value = training_config.get('gradient_clip_value', 1.0)
-    empty_cache_freq = hardware_config.get('empty_cache_freq', 10)
-    use_amp = training_config.get('use_amp', True)
-
-    optimizer.zero_grad()
-
-    # Store last batch predictions for epoch summary
-    last_predictions = []
-    last_references = []
-
-    # Progress bar for training
-    pbar = tqdm(train_loader, desc=f"Training Epoch {epoch}", leave=True, dynamic_ncols=True)
-
-    for i, batch in enumerate(pbar):
-        scheduler.step()
-
-        # Periodic memory cleanup
-        if i % empty_cache_freq == 0:
-            clear_memory()
-
-        spectrograms, labels, input_lengths, label_lengths, references, mask = batch
-
-        # Move to device
-        spectrograms = spectrograms.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        input_lengths = torch.tensor(input_lengths, device=device)
-        label_lengths = torch.tensor(label_lengths, device=device)
-        mask = mask.to(device, non_blocking=True)
-
-        # Forward pass with mixed precision
-        with autocast(enabled=use_amp):
-            outputs = encoder(spectrograms, mask)
-            outputs = decoder(outputs)
-            loss = criterion(
-                F.log_softmax(outputs, dim=-1).transpose(0, 1),
-                labels,
-                input_lengths,
-                label_lengths
-            )
-            # Scale loss for gradient accumulation
-            scaled_loss = loss / accumulate_iters
-
-        # Backward pass
-        grad_scaler.scale(scaled_loss).backward()
-
-        # Gradient accumulation step
-        if (i + 1) % accumulate_iters == 0:
-            # Unscale gradients for clipping
-            grad_scaler.unscale_(optimizer)
-
-            # Gradient clipping to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(decoder.parameters()),
-                gradient_clip_value
-            )
-
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
-            optimizer.zero_grad()
-
-        # Track loss
-        avg_loss.update(loss.detach().item())
-
-        # Compute predictions and WER
-        with torch.no_grad():
-            inds = char_decoder(outputs.detach())
-            predictions = [text_transform.int_to_text(sample) for sample in inds]
-            batch_wer = wer_metric(predictions, references) * 100
-            error_rate.update(batch_wer)
-
-            # Store for epoch summary (keep last batch)
-            last_predictions = predictions
-            last_references = references
-
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': f'{avg_loss.avg:.4f}',
-            'wer': f'{error_rate.avg:.2f}%',
-            'lr': f'{scheduler.get_last_lr()[0]:.6f}'
-        })
-
-        # Log to wandb periodically
-        if (i + 1) % 50 == 0:
-            log_wandb({
-                'train/step_loss': loss.detach().item(),
-                'train/step_wer': batch_wer,
-                'train/learning_rate': scheduler.get_last_lr()[0],
-            })
-
-        # Free memory
-        del spectrograms, labels, mask, outputs
-
-    pbar.close()
-
-    return error_rate.avg if error_rate.avg else 0.0, avg_loss.avg, last_predictions, last_references
-
-
-def validate(encoder, decoder, char_decoder, criterion, test_loader, config, device, device_info, epoch):
-    """Evaluate model on test dataset."""
-    from torchmetrics.text.wer import WordErrorRate
-
-    training_config = config['training']
-    use_amp = training_config.get('use_amp', True)
-
-    avg_loss = AvgMeter()
-    error_rate = AvgMeter()
-    wer_metric = WordErrorRate()
-    text_transform = get_text_transform()
-
-    encoder.eval()
-    decoder.eval()
-
-    # Store last batch predictions for epoch summary
-    last_predictions = []
-    last_references = []
-
-    # Progress bar for validation
-    pbar = tqdm(test_loader, desc=f"Validation Epoch {epoch}", leave=True, dynamic_ncols=True)
+    all_predictions = []
+    all_references = []
 
     with torch.no_grad():
-        for i, batch in enumerate(pbar):
-            spectrograms, labels, input_lengths, label_lengths, references, mask = batch
+        pbar = tqdm(val_loader, desc="Validating", disable=(rank != 0))
 
-            # Move to device
-            spectrograms = spectrograms.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            input_lengths = torch.tensor(input_lengths, device=device)
-            label_lengths = torch.tensor(label_lengths, device=device)
-            mask = mask.to(device, non_blocking=True)
+        for batch in pbar:
+            mels, mel_lengths, tokens, token_lengths, utterances = batch
+            mels = mels.to(device)
+            mel_lengths = mel_lengths.to(device)
 
-            with autocast(enabled=use_amp):
-                outputs = encoder(spectrograms, mask)
-                outputs = decoder(outputs)
-                loss = criterion(
-                    F.log_softmax(outputs, dim=-1).transpose(0, 1),
-                    labels,
-                    input_lengths,
-                    label_lengths
-                )
+            # Encode
+            encoder_out, encoder_lengths, _ = model.encode(mels, mel_lengths, mode="offline")
 
-            avg_loss.update(loss.item())
+            # Greedy decode
+            decoded = greedy_decode(model, encoder_out)
 
-            inds = char_decoder(outputs.detach())
-            predictions = [text_transform.int_to_text(sample) for sample in inds]
-            batch_wer = wer_metric(predictions, references) * 100
-            error_rate.update(batch_wer)
+            # Convert to text
+            for i, dec in enumerate(decoded):
+                pred_text = text_transform.int_to_text(dec)
+                ref_text = utterances[i].upper()
 
-            # Store for epoch summary (keep last batch)
-            last_predictions = predictions
-            last_references = references
+                all_predictions.append(pred_text)
+                all_references.append(ref_text)
 
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f'{avg_loss.avg:.4f}',
-                'wer': f'{error_rate.avg:.2f}%'
+    # Compute metrics
+    wer = wer_metric(all_predictions, all_references).item() * 100
+    cer = cer_metric(all_predictions, all_references).item() * 100
+
+    return wer, cer, all_predictions[:5], all_references[:5]
+
+
+def train_epoch(
+    model,
+    train_loader,
+    optimizer,
+    scheduler,
+    scaler,
+    device,
+    epoch,
+    config,
+    rank=0,
+    wandb_run=None,
+):
+    """Train for one epoch."""
+    model.train()
+
+    loss_meter = AvgMeter()
+    grad_norm_meter = AvgMeter()
+
+    pbar = tqdm(
+        train_loader,
+        desc=f"Epoch {epoch}",
+        disable=(rank != 0),
+    )
+
+    for batch_idx, batch in enumerate(pbar):
+        mels, mel_lengths, tokens, token_lengths, _ = batch
+        mels = mels.to(device)
+        mel_lengths = mel_lengths.to(device)
+        tokens = tokens.to(device)
+        token_lengths = token_lengths.to(device)
+
+        optimizer.zero_grad()
+
+        # Mixed precision forward
+        with autocast(device_type='cuda', enabled=config['training'].get('use_amp', True)):
+            logits, encoder_lengths = model(
+                mels, mel_lengths, tokens, token_lengths, mode="offline"
+            )
+
+            # RNN-T loss
+            # logits: (batch, T, U+1, vocab_size)
+            # targets: (batch, U)
+            log_probs = torch.log_softmax(logits, dim=-1)
+
+            loss = torch.nn.functional.rnnt_loss(
+                log_probs,
+                tokens.int(),
+                encoder_lengths.int(),
+                token_lengths.int(),
+                blank=model.blank_id,
+                reduction='mean',
+            )
+
+        # Backward with gradient scaling
+        scaler.scale(loss).backward()
+
+        # Gradient clipping
+        scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            config['training'].get('grad_clip', 1.0),
+        )
+
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+
+        # Update meters
+        loss_meter.update(loss.item())
+        grad_norm_meter.update(grad_norm.item())
+
+        # Update progress bar
+        current_lr = scheduler.get_last_lr()[0]
+        pbar.set_postfix({
+            'loss': f'{loss_meter.avg:.4f}',
+            'lr': f'{current_lr:.2e}',
+            'grad': f'{grad_norm_meter.avg:.2f}',
+        })
+
+        # Log to wandb
+        if wandb_run is not None and batch_idx % 100 == 0:
+            wandb_run.log({
+                'train/loss': loss.item(),
+                'train/lr': current_lr,
+                'train/grad_norm': grad_norm.item(),
+                'train/step': scheduler.n_steps,
             })
 
-            # Free memory
-            del spectrograms, labels, mask, outputs
-
-    pbar.close()
-
-    return error_rate.avg, avg_loss.avg, last_predictions, last_references
+    return loss_meter.avg
 
 
-def save_best_wer_checkpoint(encoder, decoder, wer, epoch, checkpoint_path):
-    """Save checkpoint with best WER (model weights only)."""
-    checkpoint_dir = os.path.dirname(checkpoint_path)
-    if checkpoint_dir and not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir, exist_ok=True)
+def save_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch,
+    wer,
+    config,
+    checkpoint_path,
+    is_best=False,
+):
+    """Save model checkpoint."""
+    # Handle DDP wrapped models
+    model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
 
-    torch.save({
+    checkpoint = {
         'epoch': epoch,
-        'best_wer': wer,
-        'encoder_state_dict': encoder.state_dict(),
-        'decoder_state_dict': decoder.state_dict(),
-    }, checkpoint_path)
+        'wer': wer,
+        'model_state_dict': model_state,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_n_steps': scheduler.n_steps,
+        'scheduler_multiplier': scheduler.multiplier,
+        'scheduler_warmup_steps': scheduler.warmup_steps,
+        'scaler_state_dict': scaler.state_dict(),
+        'config': config,
+    }
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+
+    torch.save(checkpoint, checkpoint_path)
+
+    if is_best:
+        best_path = checkpoint_path.replace('checkpoint.pt', 'best_model.pt')
+        torch.save(checkpoint, best_path)
 
 
-def main_worker(rank, world_size, config, device_info):
-    """Main training worker (single or distributed)."""
-    training_config = config['training']
-    model_config = config['model']
-    checkpoint_config = config['checkpoint']
-    hardware_config = config.get('hardware', {})
+def load_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    checkpoint_path,
+    device,
+):
+    """Load model checkpoint."""
+    if not os.path.exists(checkpoint_path):
+        print(f"No checkpoint found at {checkpoint_path}")
+        return 0, float('inf')
 
-    # Setup device
-    if device_info['use_distributed']:
+    print(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Handle DDP wrapped models
+    if hasattr(model, 'module'):
+        model.module.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.n_steps = checkpoint['scheduler_n_steps']
+    scheduler.multiplier = checkpoint['scheduler_multiplier']
+    scheduler.warmup_steps = checkpoint['scheduler_warmup_steps']
+    scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+    return checkpoint['epoch'], checkpoint.get('wer', float('inf'))
+
+
+def get_dataset(config, split: str = "train"):
+    """Get dataset based on configuration."""
+    dataset_config = config['data']
+    dataset_name = dataset_config.get('dataset', 'librispeech')
+
+    if dataset_name == 'librispeech':
+        # LibriSpeech
+        subset = dataset_config.get('train_subset', 'train-clean-100') if split == 'train' else dataset_config.get('val_subset', 'dev-clean')
+        root = dataset_config.get('data_root', './data')
+
+        dataset = torchaudio.datasets.LIBRISPEECH(
+            root=root,
+            url=subset,
+            download=dataset_config.get('download', True),
+        )
+        return dataset, 'librispeech'
+
+    elif dataset_name == 'ljspeech':
+        # LJSpeech
+        root = dataset_config.get('data_root', './data')
+
+        full_dataset = torchaudio.datasets.LJSPEECH(
+            root=root,
+            download=dataset_config.get('download', True),
+        )
+
+        # Split LJSpeech (no official splits)
+        n_total = len(full_dataset)
+        n_val = int(n_total * 0.05)  # 5% for validation
+
+        if split == 'train':
+            return torch.utils.data.Subset(full_dataset, range(n_val, n_total)), 'ljspeech'
+        else:
+            return torch.utils.data.Subset(full_dataset, range(n_val)), 'ljspeech'
+
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+def train(rank, world_size, config, args):
+    """Main training function."""
+    # Setup distributed if multi-GPU
+    is_distributed = world_size > 1
+    if is_distributed:
         setup_distributed(rank, world_size)
         device = torch.device(f'cuda:{rank}')
-        torch.cuda.set_device(device)
     else:
-        if device_info['device'] == 'cuda':
-            device = torch.device('cuda:0')
-            torch.cuda.set_device(device)
-        else:
-            device = torch.device('cpu')
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    is_main_process = rank == 0
+    is_main = (rank == 0)
 
-    # Initialize wandb (only on main process)
-    if is_main_process:
-        init_wandb(config, device_info)
+    # Initialize wandb (main process only)
+    wandb_run = None
+    if is_main and config.get('wandb', {}).get('enabled', False):
+        import wandb
+        wandb_run = wandb.init(
+            project=config['wandb'].get('project', 'fastconformer-transducer'),
+            name=config['wandb'].get('run_name', None),
+            config=config,
+        )
 
-    if is_main_process:
-        print(f"\n{'='*60}")
-        print(f"Training Conformer: {model_config['name']}")
-        print(f"Device: {device_info['device_name']}")
-        print(f"Mixed Precision: {training_config.get('use_amp', True)}")
-        print(f"{'='*60}\n")
+    # Create model
+    model = create_model(config)
+    model = model.to(device)
 
-    # Create dataloaders
-    train_loader, test_loader = create_dataloaders(config, device_info, rank, world_size)
+    if is_main:
+        model_size(model, "FastConformer-Transducer")
 
-    # Create models
-    encoder, decoder = create_model(config, device)
+    if is_distributed:
+        model = DDP(model, device_ids=[rank])
 
-    # Print model info
-    if is_main_process:
-        model_size(encoder, 'Encoder')
-        model_size(decoder, 'Decoder')
+    # Text transform
+    text_transform = get_text_transform()
 
-    # Wrap with DDP if distributed
-    if device_info['use_distributed']:
-        encoder = DDP(encoder, device_ids=[rank])
-        decoder = DDP(decoder, device_ids=[rank])
+    # Audio transforms
+    train_audio_transform = get_audio_transforms(
+        sample_rate=config['data'].get('sample_rate', 16000),
+        n_mels=config['model'].get('d_input', 80),
+        training=True,
+    ).to(device)
 
-    # Create other components
-    char_decoder = GreedyCharacterDecoder().eval().to(device)
-    criterion = nn.CTCLoss(blank=28, zero_infinity=True).to(device)
+    val_audio_transform = get_audio_transforms(
+        sample_rate=config['data'].get('sample_rate', 16000),
+        n_mels=config['model'].get('d_input', 80),
+        training=False,
+    ).to(device)
 
-    # Optimizer with proper eps for mixed precision
-    use_amp = training_config.get('use_amp', True)
-    optimizer = torch.optim.AdamW(
-        list(encoder.parameters()) + list(decoder.parameters()),
-        lr=5e-4,
-        betas=(0.9, 0.98),
-        eps=1e-05 if use_amp else 1e-09,
-        weight_decay=training_config.get('weight_decay', 1e-6)
+    # Datasets
+    train_data, train_type = get_dataset(config, 'train')
+    val_data, val_type = get_dataset(config, 'val')
+
+    train_dataset = TransducerDataset(
+        train_data,
+        text_transform,
+        train_audio_transform.cpu(),  # Move back to CPU for DataLoader workers
+        target_sample_rate=config['data'].get('sample_rate', 16000),
+        dataset_type=train_type,
     )
 
+    val_dataset = TransducerDataset(
+        val_data,
+        text_transform,
+        val_audio_transform.cpu(),
+        target_sample_rate=config['data'].get('sample_rate', 16000),
+        dataset_type=val_type,
+    )
+
+    # DataLoaders
+    train_sampler = DistributedSampler(train_dataset) if is_distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['training'].get('batch_size', 8),
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=config['training'].get('num_workers', 4),
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['training'].get('batch_size', 8),
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=config['training'].get('num_workers', 4),
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config['training'].get('lr', 1e-3),
+        weight_decay=config['training'].get('weight_decay', 1e-6),
+        betas=(0.9, 0.98),
+    )
+
+    # Scheduler
+    d_model = config['model'].get('d_encoder', 256)
+    warmup_steps = config['training'].get('warmup_steps', 10000)
     scheduler = TransformerLrScheduler(
         optimizer,
-        model_config['d_encoder'],
-        training_config['warmup_steps']
+        d_model=d_model,
+        warmup_steps=warmup_steps,
+        multiplier=config['training'].get('lr_multiplier', 5),
     )
 
-    # Mixed precision scaler
-    grad_scaler = GradScaler(enabled=use_amp)
+    # Gradient scaler for mixed precision
+    scaler = GradScaler()
 
-    # Load checkpoint if specified
+    # Load checkpoint if resuming
     start_epoch = 0
-    best_loss = float('inf')
     best_wer = float('inf')
+    checkpoint_dir = config['training'].get('checkpoint_dir', './checkpoints')
+    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pt')
 
-    if checkpoint_config.get('load_checkpoint', False):
-        checkpoint_path = checkpoint_config['checkpoint_path']
-        if os.path.exists(checkpoint_path):
-            if is_main_process:
-                print(f'Loading checkpoint from {checkpoint_path}...')
-
-            # Handle DDP wrapped models
-            enc_to_load = encoder.module if device_info['use_distributed'] else encoder
-            dec_to_load = decoder.module if device_info['use_distributed'] else decoder
-
-            start_epoch, best_loss = load_checkpoint(
-                enc_to_load, dec_to_load, optimizer, scheduler, checkpoint_path
-            )
-            if is_main_process:
-                print(f'Resumed training from epoch {start_epoch}')
-        else:
-            if is_main_process:
-                print(f'No checkpoint found at {checkpoint_path}, starting fresh')
-
-    # Ensure checkpoint directory exists
-    checkpoint_dir = checkpoint_config.get('save_dir', 'checkpoints')
-    if is_main_process and checkpoint_dir:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-    # Define checkpoint paths
-    resume_checkpoint_path = checkpoint_config.get('checkpoint_path', os.path.join(checkpoint_dir, 'checkpoint_latest.pt'))
-    best_wer_checkpoint_path = checkpoint_config.get('best_wer_path', os.path.join(checkpoint_dir, 'best_wer.pt'))
-
-    # Clear memory before training
-    clear_memory()
+    if args.resume and os.path.exists(checkpoint_path):
+        start_epoch, best_wer = load_checkpoint(
+            model, optimizer, scheduler, scaler, checkpoint_path, device
+        )
+        start_epoch += 1
+        if is_main:
+            print(f"Resumed from epoch {start_epoch}, best WER: {best_wer:.2f}%")
 
     # Training loop
-    for epoch in range(start_epoch, training_config['epochs']):
-        current_epoch = epoch + 1
+    num_epochs = config['training'].get('epochs', 100)
 
-        if is_main_process:
-            print(f"\n{'='*60}")
-            print(f"Epoch {current_epoch}/{training_config['epochs']}")
-            print(f"{'='*60}")
-
-        clear_memory()
-
-        # Add variational noise for regularization
-        noise_std = training_config.get('variational_noise_std', 0.0001)
-        if noise_std > 0:
-            enc_model = encoder.module if device_info['use_distributed'] else encoder
-            dec_model = decoder.module if device_info['use_distributed'] else decoder
-            add_model_noise(enc_model, std=noise_std, device=device)
-            add_model_noise(dec_model, std=noise_std, device=device)
+    for epoch in range(start_epoch, num_epochs):
+        if is_distributed:
+            train_sampler.set_epoch(epoch)
 
         # Train
-        train_wer, train_loss, train_preds, train_refs = train_epoch(
-            encoder, decoder, char_decoder, optimizer, scheduler,
-            criterion, grad_scaler, train_loader, config, device, device_info, current_epoch
+        train_loss = train_epoch(
+            model, train_loader, optimizer, scheduler, scaler,
+            device, epoch, config, rank, wandb_run
         )
 
         # Validate
-        valid_wer, valid_loss, valid_preds, valid_refs = validate(
-            encoder, decoder, char_decoder, criterion, test_loader,
-            config, device, device_info, current_epoch
+        wer, cer, sample_preds, sample_refs = validate(
+            model, val_loader, device, text_transform, rank
         )
 
-        if is_main_process:
-            # Select random samples for display (max 2)
-            num_samples = min(2, len(valid_preds))
-            if num_samples > 0:
-                indices = random.sample(range(len(valid_preds)), num_samples)
-                sample_preds = [valid_preds[i] for i in indices]
-                sample_refs = [valid_refs[i] for i in indices]
-            else:
-                sample_preds = []
-                sample_refs = []
-
-            # Print epoch summary
-            print(f"\nEpoch {current_epoch} Summary:")
-            print(f"  Train WER: {train_wer:.2f}%, Train Loss: {train_loss:.4f}")
-            print(f"  Valid WER: {valid_wer:.2f}%, Valid Loss: {valid_loss:.4f}")
+        if is_main:
+            # Print results
+            print(f"\nEpoch {epoch} Results:")
+            print(f"  Train Loss: {train_loss:.4f}")
+            print(f"  WER: {wer:.2f}%")
+            print(f"  CER: {cer:.2f}%")
+            print(f"\nSample Predictions:")
+            for i, (pred, ref) in enumerate(zip(sample_preds, sample_refs)):
+                print(f"  [{i+1}] Ref: {ref}")
+                print(f"       Pred: {pred}")
 
             # Log to wandb
-            log_wandb({
-                'epoch': current_epoch,
-                'train/epoch_wer': train_wer,
-                'train/epoch_loss': train_loss,
-                'valid/epoch_wer': valid_wer,
-                'valid/epoch_loss': valid_loss,
-                'learning_rate': scheduler.get_last_lr()[0],
-            }, step=current_epoch)
+            if wandb_run is not None:
+                wandb_run.log({
+                    'val/wer': wer,
+                    'val/cer': cer,
+                    'val/train_loss': train_loss,
+                    'epoch': epoch,
+                })
 
-            # Get models for saving
-            enc_to_save = encoder.module if device_info['use_distributed'] else encoder
-            dec_to_save = decoder.module if device_info['use_distributed'] else decoder
+            # Save checkpoint
+            is_best = wer < best_wer
+            if is_best:
+                best_wer = wer
+                print(f"  New best WER: {best_wer:.2f}%")
 
-            # Save checkpoint if validation loss improved
-            if valid_loss <= best_loss:
-                print(f"  Validation loss improved ({best_loss:.4f} -> {valid_loss:.4f}), saving checkpoint...")
-                best_loss = valid_loss
+            save_checkpoint(
+                model, optimizer, scheduler, scaler,
+                epoch, wer, config, checkpoint_path, is_best
+            )
 
-                save_checkpoint(
-                    enc_to_save, dec_to_save, optimizer, scheduler,
-                    valid_loss, current_epoch, resume_checkpoint_path
-                )
-
-            # Save best WER checkpoint
-            if valid_wer <= best_wer:
-                print(f"  Best WER improved ({best_wer:.2f}% -> {valid_wer:.2f}%), saving best WER checkpoint...")
-                best_wer = valid_wer
-
-                save_best_wer_checkpoint(
-                    enc_to_save, dec_to_save, valid_wer, current_epoch, best_wer_checkpoint_path
-                )
-
-                # Log best WER to wandb
-                log_wandb({'best_wer': best_wer})
-
-            # Print sample predictions
-            if sample_preds:
-                print(f"  Sample Predictions: {sample_preds}")
-                print(f"  Original References: {sample_refs}")
+        # Clear memory
+        clear_memory()
 
     # Cleanup
-    if device_info['use_distributed']:
+    if is_distributed:
         cleanup_distributed()
 
-    if is_main_process:
-        print(f"\n{'='*60}")
-        print("Training completed!")
-        print(f"Best validation loss: {best_loss:.4f}")
-        print(f"Best WER: {best_wer:.2f}%")
-        print(f"{'='*60}")
-
-        # Finish wandb
-        finish_wandb()
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 def main():
-    """Main entry point."""
-    # Load configuration
+    parser = argparse.ArgumentParser(description='Train FastConformer-Transducer ASR')
+    parser.add_argument('--config', type=str, required=True, help='Path to config file')
+    parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
+    args = parser.parse_args()
+
+    # Load config
     config = load_config(args.config)
 
-    print(f"\n{'='*60}")
-    print("Conformer ASR Training")
-    print(f"Config: {args.config}")
-    print(f"{'='*60}\n")
-
-    # Detect devices
+    # Get device info
     device_info = get_device_info()
+    world_size = device_info['num_devices'] if device_info['use_distributed'] else 1
 
-    # Check distributed setting from config
-    hardware_config = config.get('hardware', {})
-    distributed_setting = hardware_config.get('distributed', 'auto')
-
-    if distributed_setting == 'auto':
-        # Use auto-detected setting
-        pass
-    elif distributed_setting == 'single':
-        device_info['use_distributed'] = False
-    elif distributed_setting == 'multi':
-        if device_info['num_devices'] > 1:
-            device_info['use_distributed'] = True
-        else:
-            print("Warning: Multi-GPU requested but only 1 GPU available")
-            device_info['use_distributed'] = False
-
-    # Run training
-    if device_info['use_distributed']:
-        world_size = device_info['num_devices']
-        print(f"Starting distributed training with {world_size} GPUs...")
+    if world_size > 1:
+        # Multi-GPU training
         mp.spawn(
-            main_worker,
-            args=(world_size, config, device_info),
+            train,
+            args=(world_size, config, args),
             nprocs=world_size,
-            join=True
+            join=True,
         )
     else:
-        main_worker(0, 1, config, device_info)
+        # Single GPU or CPU training
+        train(0, 1, config, args)
 
 
 if __name__ == '__main__':
