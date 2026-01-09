@@ -41,7 +41,9 @@
     "warmup_steps": 15000,
     "grad_clip": 0.5,
     "use_amp": true,
-    "checkpoint_dir": "./checkpoints/fastconformer_small"
+    "checkpoint_dir": "./checkpoints/fastconformer_small",
+    "debug": false,
+    "debug_interval": 50
   },
 
   "streaming": {

@@ -1092,6 +1092,7 @@ class FastConformerTransducer(nn.Module):
         audio_lengths: torch.Tensor,
         targets: torch.Tensor,
         target_lengths: torch.Tensor,
+        debug: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for training.
@@ -1101,13 +1102,20 @@ class FastConformerTransducer(nn.Module):
             audio_lengths: (batch,)
             targets: (batch, max_target_len)
             target_lengths: (batch,)
+            debug: Enable debug output for tensor statistics
 
         Returns:
             logits: (batch, T, U+1, vocab_size)
             encoder_lengths: (batch,)
         """
+        if debug:
+            self._debug_tensor(audio, "input.audio")
+
         # Encode
         encoder_out, encoder_lengths, _ = self.encoder(audio, audio_lengths)
+
+        if debug:
+            self._debug_tensor(encoder_out, "encoder.output")
 
         # Prepend blank for predictor
         batch_size = targets.size(0)
@@ -1117,10 +1125,49 @@ class FastConformerTransducer(nn.Module):
         # Predict
         predictor_out = self.predictor(predictor_input)
 
+        if debug:
+            self._debug_tensor(predictor_out, "predictor.output")
+
         # Joint
         logits = self.joint(encoder_out, predictor_out)
 
+        if debug:
+            self._debug_tensor(logits, "joint.logits")
+
         return logits, encoder_lengths
+
+    def _debug_tensor(self, tensor: torch.Tensor, name: str):
+        """Print tensor debug statistics."""
+        with torch.no_grad():
+            t = tensor.float()
+            has_nan = torch.isnan(t).any().item()
+            has_inf = torch.isinf(t).any().item()
+
+            finite_mask = torch.isfinite(t)
+            if finite_mask.any():
+                finite_vals = t[finite_mask]
+                stats = {
+                    "min": finite_vals.min().item(),
+                    "max": finite_vals.max().item(),
+                    "mean": finite_vals.mean().item(),
+                    "std": finite_vals.std().item() if finite_vals.numel() > 1 else 0,
+                    "abs_max": finite_vals.abs().max().item(),
+                }
+            else:
+                stats = {"min": float('nan'), "max": float('nan'), "mean": float('nan'), "std": float('nan'), "abs_max": float('nan')}
+
+            status = "OK"
+            if has_nan:
+                status = f"NaN({torch.isnan(t).sum().item()})"
+            elif has_inf:
+                status = f"Inf({torch.isinf(t).sum().item()})"
+
+            print(
+                f"[DEBUG] {name:30s} | shape={list(tensor.shape)} | "
+                f"min={stats['min']:+.4e} max={stats['max']:+.4e} | "
+                f"mean={stats['mean']:+.4e} std={stats['std']:.4e} | "
+                f"abs_max={stats['abs_max']:.4e} | {status}"
+            )
 
     def encode(
         self,

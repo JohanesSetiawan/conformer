@@ -40,6 +40,8 @@ from utils import (
     clear_memory,
     get_text_transform,
     AvgMeter,
+    TensorDebugger,
+    check_for_nan,
 )
 
 
@@ -230,6 +232,7 @@ def train_epoch(
     config,
     rank=0,
     wandb_run=None,
+    debugger=None,
 ):
     """Train for one epoch."""
     model.train()
@@ -247,6 +250,8 @@ def train_epoch(
     )
 
     use_amp = config['training'].get('use_amp', True)
+    debug_mode = config['training'].get('debug', False)
+    debug_interval = config['training'].get('debug_interval', 50)
 
     nan_count = 0
     max_nan_skip = 10  # Skip up to 10 NaN batches before raising error
@@ -258,34 +263,71 @@ def train_epoch(
         tokens = tokens.to(device)
         token_lengths = token_lengths.to(device)
 
+        # Debug input tensors
+        should_debug = debug_mode and (batch_idx % debug_interval == 0)
+        if should_debug and debugger:
+            debugger.check(mels, "input.mels", batch_idx)
+            debugger.check(tokens.float(), "input.tokens", batch_idx)
+
         optimizer.zero_grad()
 
         # Mixed precision forward (device-agnostic)
         with get_autocast_context(device_info, enabled=use_amp):
+            # Use debug flag in model forward if debug mode is on
             logits, encoder_lengths = model(
-                mels, mel_lengths, tokens, token_lengths
+                mels, mel_lengths, tokens, token_lengths,
+                debug=should_debug,
             )
+
+            # Debug logits before loss computation
+            if should_debug and debugger:
+                debugger.check(logits, "forward.logits", batch_idx)
+                debugger.check(encoder_lengths.float(), "forward.encoder_lengths", batch_idx)
+
+            # Prepare tensors for RNN-T loss (float32 on CPU)
+            logits_cpu = logits.float().cpu()
+            tokens_cpu = tokens.int().cpu()
+            enc_len_cpu = encoder_lengths.int().cpu()
+            tok_len_cpu = token_lengths.int().cpu()
+
+            # Debug loss inputs
+            if should_debug and debugger:
+                debugger.check(logits_cpu, "rnnt.logits_cpu", batch_idx)
+                print(f"[DEBUG] rnnt.tokens_cpu: shape={list(tokens_cpu.shape)}, values={tokens_cpu[0, :10].tolist()}")
+                print(f"[DEBUG] rnnt.enc_lengths: {enc_len_cpu.tolist()}")
+                print(f"[DEBUG] rnnt.tok_lengths: {tok_len_cpu.tolist()}")
 
             # RNN-T loss (compute on CPU as torchaudio only supports CPU backend)
             # This works for both NVIDIA CUDA and AMD ROCm
-            # logits: (batch, T, U+1, vocab_size)
-            # targets: (batch, U)
             loss = F_audio.rnnt_loss(
-                logits.float().cpu(),  # Ensure float32 for loss computation
-                tokens.int().cpu(),
-                encoder_lengths.int().cpu(),
-                token_lengths.int().cpu(),
+                logits_cpu,
+                tokens_cpu,
+                enc_len_cpu,
+                tok_len_cpu,
                 blank=blank_id,
                 reduction='mean',
             ).to(device)
 
+            if should_debug:
+                print(f"[DEBUG] loss: {loss.item():.6f}")
+
         # Check for NaN loss and skip batch if needed
         if torch.isnan(loss) or torch.isinf(loss):
             nan_count += 1
-            if nan_count > max_nan_skip:
-                raise RuntimeError(f"Too many NaN losses ({nan_count}). Training unstable.")
             if rank == 0:
-                print(f"\n[Warning] NaN/Inf loss at batch {batch_idx}, skipping...")
+                print(f"\n[Warning] NaN/Inf loss at batch {batch_idx}")
+                # Print detailed debug info on NaN
+                print(f"  logits: min={logits.min().item():.4e}, max={logits.max().item():.4e}")
+                print(f"  encoder_lengths: {encoder_lengths.tolist()}")
+                print(f"  token_lengths: {token_lengths.tolist()}")
+                if debugger:
+                    debugger.check(logits, f"NaN.logits.batch{batch_idx}", batch_idx)
+
+            if nan_count > max_nan_skip:
+                if debugger:
+                    print(debugger.summary())
+                raise RuntimeError(f"Too many NaN losses ({nan_count}). Training unstable.")
+
             optimizer.zero_grad()
             continue
 
@@ -299,13 +341,21 @@ def train_epoch(
             config['training'].get('grad_clip', 1.0),
         )
 
+        # Debug gradients
+        if should_debug and debugger:
+            debugger.check_grads(model.module if hasattr(model, 'module') else model, batch_idx)
+
         # Check for NaN gradients
         if torch.isnan(grad_norm) or torch.isinf(grad_norm):
             nan_count += 1
-            if nan_count > max_nan_skip:
-                raise RuntimeError(f"Too many NaN gradients ({nan_count}). Training unstable.")
             if rank == 0:
-                print(f"\n[Warning] NaN/Inf gradient at batch {batch_idx}, skipping...")
+                print(f"\n[Warning] NaN/Inf gradient at batch {batch_idx}, grad_norm={grad_norm}")
+
+            if nan_count > max_nan_skip:
+                if debugger:
+                    print(debugger.summary())
+                raise RuntimeError(f"Too many NaN gradients ({nan_count}). Training unstable.")
+
             optimizer.zero_grad()
             continue
 
@@ -479,6 +529,21 @@ def train(rank, world_size, config, args, device_info):
             config=config,
         )
 
+    # Initialize debugger (main process only)
+    debugger = None
+    debug_mode = config['training'].get('debug', False)
+    if is_main and debug_mode:
+        checkpoint_dir = config['training'].get('checkpoint_dir', './checkpoints')
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        debug_log_file = os.path.join(checkpoint_dir, 'debug.log')
+        debugger = TensorDebugger(
+            enabled=True,
+            log_file=debug_log_file,
+            print_stats=True,
+            raise_on_nan=False,
+        )
+        print(f"[Debug] Debug mode enabled, logging to {debug_log_file}")
+
     # Create model
     model = create_model(config)
     model = model.to(device)
@@ -596,7 +661,7 @@ def train(rank, world_size, config, args, device_info):
         # Train
         train_loss = train_epoch(
             model, train_loader, optimizer, scheduler, scaler,
-            device, device_info, epoch, config, rank, wandb_run
+            device, device_info, epoch, config, rank, wandb_run, debugger
         )
 
         # Validate
@@ -644,6 +709,10 @@ def train(rank, world_size, config, args, device_info):
 
     if wandb_run is not None:
         wandb_run.finish()
+
+    # Close debugger
+    if debugger is not None:
+        debugger.close()
 
 
 def main():
