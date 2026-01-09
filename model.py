@@ -129,7 +129,6 @@ class RelativePositionalEncoding(nn.Module):
         self.scale = math.sqrt(d_model) if scale else 1.0
 
         # Create initial positional encoding
-        self.pe = None
         self._create_pe(max_len)
 
     def _create_pe(self, max_len: int):
@@ -146,12 +145,15 @@ class RelativePositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(positions.unsqueeze(1) * div_term)
         pe[:, 1::2] = torch.cos(positions.unsqueeze(1) * div_term)
 
+        # Update or create buffer
+        if hasattr(self, 'pe') and self.pe is not None:
+            del self.pe
         self.register_buffer('pe', pe)
         self.max_len = max_len
 
     def extend_pe(self, length: int):
         """Extend positional encoding if needed."""
-        if self.pe is None or length > self.max_len:
+        if not hasattr(self, 'pe') or self.pe is None or length > self.max_len:
             self._create_pe(max(length, self.max_len * 2))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
