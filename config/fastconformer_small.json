@@ -37,9 +37,9 @@
     "num_workers": 4,
     "lr": 0.001,
     "weight_decay": 1e-6,
-    "lr_multiplier": 5,
-    "warmup_steps": 10000,
-    "grad_clip": 1.0,
+    "lr_multiplier": 2.0,
+    "warmup_steps": 15000,
+    "grad_clip": 0.5,
     "use_amp": true,
     "checkpoint_dir": "./checkpoints/fastconformer_small"
   },

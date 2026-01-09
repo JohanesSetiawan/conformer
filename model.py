@@ -969,12 +969,14 @@ class JointNetwork(nn.Module):
         d_predictor: int,
         d_joint: int,
         vocab_size: int,
+        logit_clamp: float = 15.0,  # Clamp logits for numerical stability
     ):
         super().__init__()
 
         self.encoder_proj = nn.Linear(d_encoder, d_joint)
         self.predictor_proj = nn.Linear(d_predictor, d_joint)
         self.output_proj = nn.Linear(d_joint, vocab_size)
+        self.logit_clamp = logit_clamp
 
     def forward(
         self,
@@ -992,7 +994,13 @@ class JointNetwork(nn.Module):
         enc = self.encoder_proj(encoder_out).unsqueeze(2)
         pred = self.predictor_proj(predictor_out).unsqueeze(1)
         joint = torch.tanh(enc + pred)
-        return self.output_proj(joint)
+        logits = self.output_proj(joint)
+
+        # Clamp logits to prevent overflow in softmax/loss computation
+        if self.logit_clamp > 0:
+            logits = logits.clamp(-self.logit_clamp, self.logit_clamp)
+
+        return logits
 
 
 # =============================================================================

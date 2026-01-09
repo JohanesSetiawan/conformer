@@ -248,6 +248,9 @@ def train_epoch(
 
     use_amp = config['training'].get('use_amp', True)
 
+    nan_count = 0
+    max_nan_skip = 10  # Skip up to 10 NaN batches before raising error
+
     for batch_idx, batch in enumerate(pbar):
         mels, mel_lengths, tokens, token_lengths, _ = batch
         mels = mels.to(device)
@@ -276,6 +279,16 @@ def train_epoch(
                 reduction='mean',
             ).to(device)
 
+        # Check for NaN loss and skip batch if needed
+        if torch.isnan(loss) or torch.isinf(loss):
+            nan_count += 1
+            if nan_count > max_nan_skip:
+                raise RuntimeError(f"Too many NaN losses ({nan_count}). Training unstable.")
+            if rank == 0:
+                print(f"\n[Warning] NaN/Inf loss at batch {batch_idx}, skipping...")
+            optimizer.zero_grad()
+            continue
+
         # Backward with gradient scaling (scaler handles enabled/disabled automatically)
         scaler.scale(loss).backward()
 
@@ -286,9 +299,22 @@ def train_epoch(
             config['training'].get('grad_clip', 1.0),
         )
 
+        # Check for NaN gradients
+        if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+            nan_count += 1
+            if nan_count > max_nan_skip:
+                raise RuntimeError(f"Too many NaN gradients ({nan_count}). Training unstable.")
+            if rank == 0:
+                print(f"\n[Warning] NaN/Inf gradient at batch {batch_idx}, skipping...")
+            optimizer.zero_grad()
+            continue
+
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
+
+        # Reset NaN count on successful step
+        nan_count = 0
 
         # Update meters
         loss_meter.update(loss.item())
