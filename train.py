@@ -384,6 +384,9 @@ def get_dataset(config, split: str = "train"):
         subset = dataset_config.get('train_subset', 'train-clean-100') if split == 'train' else dataset_config.get('val_subset', 'dev-clean')
         root = dataset_config.get('data_root', './data')
 
+        # Create directory if not exists
+        os.makedirs(root, exist_ok=True)
+
         dataset = torchaudio.datasets.LIBRISPEECH(
             root=root,
             url=subset,
@@ -394,6 +397,9 @@ def get_dataset(config, split: str = "train"):
     elif dataset_name == 'ljspeech':
         # LJSpeech
         root = dataset_config.get('data_root', './data')
+
+        # Create directory if not exists
+        os.makedirs(root, exist_ok=True)
 
         full_dataset = torchaudio.datasets.LJSPEECH(
             root=root,
@@ -530,6 +536,7 @@ def train(rank, world_size, config, args):
     start_epoch = 0
     best_wer = float('inf')
     checkpoint_dir = config['training'].get('checkpoint_dir', './checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pt')
 
     if args.resume and os.path.exists(checkpoint_path):
