@@ -425,3 +425,269 @@ def view_spectrogram(sample: torch.Tensor):
     plt.title('Mel Spectrogram')
     plt.tight_layout()
     plt.show()
+
+
+# =============================================================================
+# Debug Utilities for Tensor Inspection
+# =============================================================================
+
+class TensorDebugger:
+    """
+    Comprehensive tensor debugger for tracing NaN/Inf issues.
+
+    Usage:
+        debugger = TensorDebugger(enabled=True, log_file="debug.log")
+        debugger.check(tensor, "layer_name")
+    """
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        log_file: str = None,
+        print_stats: bool = True,
+        raise_on_nan: bool = False,
+        max_history: int = 100,
+    ):
+        self.enabled = enabled
+        self.log_file = log_file
+        self.print_stats = print_stats
+        self.raise_on_nan = raise_on_nan
+        self.max_history = max_history
+
+        self.history = []
+        self.nan_locations = []
+        self._file_handle = None
+
+        if log_file and enabled:
+            self._file_handle = open(log_file, 'w')
+            self._log("=" * 80)
+            self._log("TENSOR DEBUGGER INITIALIZED")
+            self._log("=" * 80)
+
+    def _log(self, msg: str):
+        """Log message to file and/or console."""
+        if self._file_handle:
+            self._file_handle.write(msg + "\n")
+            self._file_handle.flush()
+        if self.print_stats:
+            print(msg)
+
+    def get_tensor_stats(self, tensor: torch.Tensor) -> dict:
+        """Get comprehensive statistics for a tensor."""
+        if tensor is None:
+            return {"error": "tensor is None"}
+
+        with torch.no_grad():
+            t = tensor.float().detach()
+
+            stats = {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "device": str(tensor.device),
+                "has_nan": bool(torch.isnan(t).any()),
+                "has_inf": bool(torch.isinf(t).any()),
+                "nan_count": int(torch.isnan(t).sum()),
+                "inf_count": int(torch.isinf(t).sum()),
+            }
+
+            # Compute stats only on finite values
+            finite_mask = torch.isfinite(t)
+            if finite_mask.any():
+                finite_vals = t[finite_mask]
+                stats.update({
+                    "min": float(finite_vals.min()),
+                    "max": float(finite_vals.max()),
+                    "mean": float(finite_vals.mean()),
+                    "std": float(finite_vals.std()) if finite_vals.numel() > 1 else 0.0,
+                    "abs_max": float(finite_vals.abs().max()),
+                })
+            else:
+                stats.update({
+                    "min": float('nan'),
+                    "max": float('nan'),
+                    "mean": float('nan'),
+                    "std": float('nan'),
+                    "abs_max": float('nan'),
+                })
+
+            return stats
+
+    def format_stats(self, name: str, stats: dict) -> str:
+        """Format tensor stats as a readable string."""
+        if "error" in stats:
+            return f"[DEBUG] {name}: {stats['error']}"
+
+        status = "OK"
+        if stats["has_nan"]:
+            status = f"NaN({stats['nan_count']})"
+        elif stats["has_inf"]:
+            status = f"Inf({stats['inf_count']})"
+
+        return (
+            f"[DEBUG] {name:40s} | "
+            f"shape={stats['shape']} | "
+            f"min={stats['min']:+.4e} max={stats['max']:+.4e} | "
+            f"mean={stats['mean']:+.4e} std={stats['std']:.4e} | "
+            f"abs_max={stats['abs_max']:.4e} | "
+            f"{status}"
+        )
+
+    def check(
+        self,
+        tensor: torch.Tensor,
+        name: str,
+        step: int = None,
+    ) -> dict:
+        """
+        Check tensor for issues and log statistics.
+
+        Args:
+            tensor: Tensor to check
+            name: Name/label for this tensor
+            step: Optional step/batch number
+
+        Returns:
+            Dictionary of tensor statistics
+        """
+        if not self.enabled:
+            return {}
+
+        stats = self.get_tensor_stats(tensor)
+        stats["name"] = name
+        stats["step"] = step
+
+        # Log
+        msg = self.format_stats(name, stats)
+        if step is not None:
+            msg = f"[Step {step}] " + msg
+        self._log(msg)
+
+        # Track history
+        self.history.append(stats)
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+
+        # Track NaN locations
+        if stats.get("has_nan") or stats.get("has_inf"):
+            self.nan_locations.append({
+                "name": name,
+                "step": step,
+                "nan_count": stats.get("nan_count", 0),
+                "inf_count": stats.get("inf_count", 0),
+            })
+
+            if self.raise_on_nan:
+                raise RuntimeError(f"NaN/Inf detected in {name} at step {step}")
+
+        return stats
+
+    def check_model_params(self, model: nn.Module, step: int = None):
+        """Check all model parameters for NaN/Inf."""
+        if not self.enabled:
+            return
+
+        self._log(f"\n{'='*80}")
+        self._log(f"MODEL PARAMETER CHECK (step={step})")
+        self._log("=" * 80)
+
+        for name, param in model.named_parameters():
+            self.check(param.data, f"param.{name}", step)
+            if param.grad is not None:
+                self.check(param.grad, f"grad.{name}", step)
+
+    def check_grads(self, model: nn.Module, step: int = None):
+        """Check gradients for NaN/Inf."""
+        if not self.enabled:
+            return
+
+        self._log(f"\n--- Gradient Check (step={step}) ---")
+
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                self.check(param.grad, f"grad.{name}", step)
+
+    def summary(self) -> str:
+        """Get summary of all NaN/Inf occurrences."""
+        if not self.nan_locations:
+            return "No NaN/Inf detected"
+
+        lines = [
+            "\n" + "=" * 80,
+            "NaN/Inf SUMMARY",
+            "=" * 80,
+        ]
+
+        for loc in self.nan_locations:
+            lines.append(
+                f"  [{loc['step']}] {loc['name']}: "
+                f"NaN={loc['nan_count']}, Inf={loc['inf_count']}"
+            )
+
+        return "\n".join(lines)
+
+    def close(self):
+        """Close log file."""
+        if self._file_handle:
+            self._log(self.summary())
+            self._file_handle.close()
+
+
+def debug_tensor(
+    tensor: torch.Tensor,
+    name: str = "tensor",
+    verbose: bool = True,
+) -> dict:
+    """
+    Quick debug function for a single tensor.
+
+    Usage:
+        debug_tensor(encoder_out, "encoder_out")
+    """
+    debugger = TensorDebugger(enabled=True, print_stats=verbose)
+    return debugger.check(tensor, name)
+
+
+def check_for_nan(tensor: torch.Tensor, name: str = "tensor") -> bool:
+    """Quick check if tensor has NaN or Inf values."""
+    has_nan = torch.isnan(tensor).any().item()
+    has_inf = torch.isinf(tensor).any().item()
+
+    if has_nan or has_inf:
+        print(f"[WARNING] {name} has {'NaN' if has_nan else ''}{' and ' if has_nan and has_inf else ''}{'Inf' if has_inf else ''}")
+        return True
+    return False
+
+
+class DebugHook:
+    """
+    Forward/backward hook for debugging layer outputs.
+
+    Usage:
+        hook = DebugHook("encoder.layer_0")
+        model.encoder.layers[0].register_forward_hook(hook.forward_hook)
+        model.encoder.layers[0].register_full_backward_hook(hook.backward_hook)
+    """
+
+    def __init__(self, name: str, debugger: TensorDebugger = None):
+        self.name = name
+        self.debugger = debugger or TensorDebugger(enabled=True)
+        self.step = 0
+
+    def forward_hook(self, module, input, output):
+        """Forward hook to check layer output."""
+        if isinstance(output, tuple):
+            for i, o in enumerate(output):
+                if isinstance(o, torch.Tensor):
+                    self.debugger.check(o, f"{self.name}.output[{i}]", self.step)
+        elif isinstance(output, torch.Tensor):
+            self.debugger.check(output, f"{self.name}.output", self.step)
+
+    def backward_hook(self, module, grad_input, grad_output):
+        """Backward hook to check gradients."""
+        if isinstance(grad_output, tuple):
+            for i, g in enumerate(grad_output):
+                if isinstance(g, torch.Tensor):
+                    self.debugger.check(g, f"{self.name}.grad_out[{i}]", self.step)
+
+    def set_step(self, step: int):
+        self.step = step
