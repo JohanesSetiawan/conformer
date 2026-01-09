@@ -132,7 +132,7 @@ class TransducerDataset(torch.utils.data.Dataset):
         return mel, tokens, utterance
 
 
-def collate_fn(batch, subsampling_factor: int = 4):
+def collate_fn(batch, subsampling_factor: int = 8):
     """Collate function for DataLoader with RNN-T length validation.
 
     RNN-T loss requires encoder_length >= token_length for all samples.
@@ -140,7 +140,8 @@ def collate_fn(batch, subsampling_factor: int = 4):
 
     Args:
         batch: List of (mel, tokens, utterance) tuples
-        subsampling_factor: Encoder subsampling factor (default 4 for FastConformer)
+        subsampling_factor: Encoder subsampling factor (default 8 for FastConformer
+            with 3 conv layers @ stride 2 each = 2*2*2 = 8x subsampling)
 
     Returns:
         Tuple of (mels_padded, mel_lengths, tokens_padded, token_lengths, utterances)
@@ -153,11 +154,12 @@ def collate_fn(batch, subsampling_factor: int = 4):
     token_lengths = [t.size(0) for t in tokens]
 
     # Filter samples that satisfy RNN-T constraint: encoder_length >= token_length
-    # encoder_length = (mel_length - 1) // subsampling_factor + 1 (conservative estimate)
+    # Use conservative estimate with margin for conv layer edge effects
     valid_indices = []
     for i, (mel_len, tok_len) in enumerate(zip(mel_lengths, token_lengths)):
-        # Conservative encoder length estimate (accounting for subsampling + conv layers)
-        encoder_len = mel_len // subsampling_factor
+        # Conservative encoder length estimate with margin for conv edge effects
+        # Subtract 2 for conv kernel edge effects to be safe
+        encoder_len = max(1, (mel_len // subsampling_factor) - 2)
         if encoder_len >= tok_len:
             valid_indices.append(i)
 
@@ -333,6 +335,20 @@ def train_epoch(
             if should_debug and debugger:
                 debugger.check(logits, "forward.logits", batch_idx)
                 debugger.check(encoder_lengths.float(), "forward.encoder_lengths", batch_idx)
+
+            # Runtime validation: check RNN-T constraint after getting actual encoder_lengths
+            # encoder_length must be >= token_length for all samples
+            constraint_violated = (encoder_lengths < token_lengths).any().item()
+            if constraint_violated:
+                if rank == 0:
+                    violations = (encoder_lengths < token_lengths).nonzero(as_tuple=True)[0].tolist()
+                    print(f"\n[Warning] RNN-T constraint violated at batch {batch_idx}")
+                    print(f"  encoder_lengths: {encoder_lengths.tolist()}")
+                    print(f"  token_lengths: {token_lengths.tolist()}")
+                    print(f"  violations at indices: {violations}")
+                skip_count += 1
+                optimizer.zero_grad()
+                continue
 
             # Prepare tensors for RNN-T loss (float32 on CPU)
             logits_cpu = logits.float().cpu()
