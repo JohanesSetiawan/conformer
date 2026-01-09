@@ -251,7 +251,7 @@ def train_epoch(
         # Mixed precision forward
         with autocast(device_type='cuda', enabled=config['training'].get('use_amp', True)):
             logits, encoder_lengths = model(
-                mels, mel_lengths, tokens, token_lengths, mode="offline"
+                mels, mel_lengths, tokens, token_lengths
             )
 
             # RNN-T loss
