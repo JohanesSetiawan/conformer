@@ -1,5 +1,5 @@
 {
-  "name": "FastConformer-Transducer Large",
+  "name": "FastConformer-Transducer Large (NVIDIA-style)",
   "description": "Large FastConformer for maximum accuracy",
 
   "model": {
@@ -8,14 +8,18 @@
     "d_encoder": 512,
     "d_predictor": 384,
     "d_joint": 640,
-    "encoder_layers": 18,
+    "encoder_layers": 17,
     "encoder_heads": 8,
     "encoder_conv_kernel": 9,
     "encoder_ff_expansion": 4,
     "predictor_layers": 2,
     "predictor_kernel": 2,
     "dropout": 0.1,
-    "subsampling_channels": 256
+    "subsampling_channels": 256,
+    "use_local_attn": true,
+    "local_context": 512,
+    "stochastic_depth_prob": 0.15,
+    "conv_norm_type": "batch"
   },
 
   "data": {
@@ -40,9 +44,15 @@
     "checkpoint_dir": "./checkpoints/fastconformer_large"
   },
 
+  "streaming": {
+    "chunk_size_ms": 80,
+    "left_context_frames": 64,
+    "right_context_frames": 0
+  },
+
   "wandb": {
     "enabled": false,
     "project": "fastconformer-transducer",
-    "run_name": "fastconformer-large"
+    "run_name": "fastconformer-large-nvidia"
   }
 }

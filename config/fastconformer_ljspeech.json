@@ -1,6 +1,6 @@
 {
-  "name": "FastConformer-Transducer LJSpeech",
-  "description": "FastConformer trained on LJSpeech dataset",
+  "name": "FastConformer-Transducer LJSpeech (NVIDIA-style)",
+  "description": "FastConformer for LJSpeech single-speaker dataset",
 
   "model": {
     "d_input": 80,
@@ -8,14 +8,18 @@
     "d_encoder": 256,
     "d_predictor": 256,
     "d_joint": 320,
-    "encoder_layers": 12,
+    "encoder_layers": 17,
     "encoder_heads": 4,
     "encoder_conv_kernel": 9,
     "encoder_ff_expansion": 4,
     "predictor_layers": 2,
     "predictor_kernel": 2,
     "dropout": 0.1,
-    "subsampling_channels": 256
+    "subsampling_channels": 256,
+    "use_local_attn": true,
+    "local_context": 256,
+    "stochastic_depth_prob": 0.1,
+    "conv_norm_type": "batch"
   },
 
   "data": {
@@ -38,9 +42,15 @@
     "checkpoint_dir": "./checkpoints/fastconformer_ljspeech"
   },
 
+  "streaming": {
+    "chunk_size_ms": 80,
+    "left_context_frames": 32,
+    "right_context_frames": 0
+  },
+
   "wandb": {
     "enabled": false,
     "project": "fastconformer-transducer",
-    "run_name": "fastconformer-ljspeech"
+    "run_name": "fastconformer-ljspeech-nvidia"
   }
 }
