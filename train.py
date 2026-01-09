@@ -132,9 +132,44 @@ class TransducerDataset(torch.utils.data.Dataset):
         return mel, tokens, utterance
 
 
-def collate_fn(batch):
-    """Collate function for DataLoader."""
+def collate_fn(batch, subsampling_factor: int = 4):
+    """Collate function for DataLoader with RNN-T length validation.
+
+    RNN-T loss requires encoder_length >= token_length for all samples.
+    This function filters out samples that violate this constraint.
+
+    Args:
+        batch: List of (mel, tokens, utterance) tuples
+        subsampling_factor: Encoder subsampling factor (default 4 for FastConformer)
+
+    Returns:
+        Tuple of (mels_padded, mel_lengths, tokens_padded, token_lengths, utterances)
+        Returns None if all samples are filtered out
+    """
     mels, tokens, utterances = zip(*batch)
+
+    # Calculate expected encoder lengths after subsampling
+    mel_lengths = [m.size(0) for m in mels]
+    token_lengths = [t.size(0) for t in tokens]
+
+    # Filter samples that satisfy RNN-T constraint: encoder_length >= token_length
+    # encoder_length = (mel_length - 1) // subsampling_factor + 1 (conservative estimate)
+    valid_indices = []
+    for i, (mel_len, tok_len) in enumerate(zip(mel_lengths, token_lengths)):
+        # Conservative encoder length estimate (accounting for subsampling + conv layers)
+        encoder_len = mel_len // subsampling_factor
+        if encoder_len >= tok_len:
+            valid_indices.append(i)
+
+    # If no valid samples, return None (will be handled in training loop)
+    if len(valid_indices) == 0:
+        return None
+
+    # Filter to valid samples only
+    if len(valid_indices) < len(batch):
+        mels = [mels[i] for i in valid_indices]
+        tokens = [tokens[i] for i in valid_indices]
+        utterances = [utterances[i] for i in valid_indices]
 
     # Get lengths before padding
     mel_lengths = torch.tensor([m.size(0) for m in mels], dtype=torch.long)
@@ -254,17 +289,32 @@ def train_epoch(
     debug_interval = config['training'].get('debug_interval', 50)
 
     nan_count = 0
+    skip_count = 0
     max_nan_skip = 10  # Skip up to 10 NaN batches before raising error
 
     for batch_idx, batch in enumerate(pbar):
+        # Calculate debug flag early
+        should_debug = debug_mode and (batch_idx % debug_interval == 0)
+
+        # Handle None batch (all samples filtered due to RNN-T length constraint)
+        if batch is None:
+            skip_count += 1
+            if rank == 0 and skip_count <= 5:
+                print(f"\n[Info] Batch {batch_idx} skipped: all samples violated RNN-T length constraint")
+            continue
+
         mels, mel_lengths, tokens, token_lengths, _ = batch
+
+        # Log if samples were filtered
+        if should_debug and rank == 0:
+            original_batch_size = config['training'].get('batch_size', 8)
+            if mels.size(0) < original_batch_size:
+                print(f"[Debug] Batch {batch_idx}: {mels.size(0)}/{original_batch_size} samples (some filtered)")
+
         mels = mels.to(device)
         mel_lengths = mel_lengths.to(device)
         tokens = tokens.to(device)
         token_lengths = token_lengths.to(device)
-
-        # Debug input tensors
-        should_debug = debug_mode and (batch_idx % debug_interval == 0)
         if should_debug and debugger:
             debugger.check(mels, "input.mels", batch_idx)
             debugger.check(tokens.float(), "input.tokens", batch_idx)
@@ -356,7 +406,10 @@ def train_epoch(
                     print(debugger.summary())
                 raise RuntimeError(f"Too many NaN gradients ({nan_count}). Training unstable.")
 
+            # Reset scaler state and skip this batch
+            # scaler.update() resets internal state after unscale_ was called
             optimizer.zero_grad()
+            scaler.update()
             continue
 
         scaler.step(optimizer)
