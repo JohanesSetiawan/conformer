@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.amp import autocast, GradScaler
 import torchaudio
+import torchaudio.functional as F_audio
 from tqdm import tqdm
 from torchmetrics.text import WordErrorRate, CharErrorRate
 
@@ -257,10 +258,8 @@ def train_epoch(
             # RNN-T loss
             # logits: (batch, T, U+1, vocab_size)
             # targets: (batch, U)
-            log_probs = torch.log_softmax(logits, dim=-1)
-
-            loss = torch.nn.functional.rnnt_loss(
-                log_probs,
+            loss = F_audio.rnnt_loss(
+                logits,
                 tokens.int(),
                 encoder_lengths.int(),
                 token_lengths.int(),
