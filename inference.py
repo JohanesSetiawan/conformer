@@ -594,12 +594,17 @@ Examples:
     parser.add_argument('--simulate-realtime', action='store_true', help='Simulate real-time')
     args = parser.parse_args()
 
-    # Get device
+    # Get device (auto-detect CPU/CUDA/ROCm)
     device_info = get_device_info()
     device = torch.device(device_info['device'])
 
     # Load config
     config = load_config(args.config)
+
+    print(f"\n{'='*60}")
+    print(f"FastConformer-Transducer Inference")
+    print(f"Device: {device_info['device_name']}")
+    print(f"{'='*60}")
 
     # Determine checkpoint path
     if args.checkpoint:
@@ -614,12 +619,11 @@ Examples:
     # Text transform
     text_transform = get_text_transform()
 
-    print(f"\n{'='*60}")
-    print(f"Transcribing: {args.audio}")
+    print(f"\nTranscribing: {args.audio}")
     print(f"Mode: {'Streaming' if args.streaming else 'Offline'}")
     if args.streaming:
         print(f"Chunk size: {args.chunk_ms}ms")
-    print(f"{'='*60}\n")
+    print()
 
     if args.streaming:
         # Streaming transcription

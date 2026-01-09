@@ -22,7 +22,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.amp import autocast, GradScaler
+# Note: autocast and GradScaler are handled via utils.get_autocast_context and utils.get_grad_scaler
 import torchaudio
 import torchaudio.functional as F_audio
 from tqdm import tqdm
@@ -31,6 +31,8 @@ from torchmetrics.text import WordErrorRate, CharErrorRate
 from model import FastConformerTransducer, create_model, model_size
 from utils import (
     get_device_info,
+    get_autocast_context,
+    get_grad_scaler,
     setup_distributed,
     cleanup_distributed,
     load_config,
@@ -223,6 +225,7 @@ def train_epoch(
     scheduler,
     scaler,
     device,
+    device_info,
     epoch,
     config,
     rank=0,
@@ -234,11 +237,16 @@ def train_epoch(
     loss_meter = AvgMeter()
     grad_norm_meter = AvgMeter()
 
+    # Get blank_id from model (handle DDP wrapper)
+    blank_id = model.module.blank_id if hasattr(model, 'module') else model.blank_id
+
     pbar = tqdm(
         train_loader,
         desc=f"Epoch {epoch}",
         disable=(rank != 0),
     )
+
+    use_amp = config['training'].get('use_amp', True)
 
     for batch_idx, batch in enumerate(pbar):
         mels, mel_lengths, tokens, token_lengths, _ = batch
@@ -249,25 +257,26 @@ def train_epoch(
 
         optimizer.zero_grad()
 
-        # Mixed precision forward
-        with autocast(device_type='cuda', enabled=config['training'].get('use_amp', True)):
+        # Mixed precision forward (device-agnostic)
+        with get_autocast_context(device_info, enabled=use_amp):
             logits, encoder_lengths = model(
                 mels, mel_lengths, tokens, token_lengths
             )
 
-            # RNN-T loss
+            # RNN-T loss (compute on CPU as torchaudio only supports CPU backend)
+            # This works for both NVIDIA CUDA and AMD ROCm
             # logits: (batch, T, U+1, vocab_size)
             # targets: (batch, U)
             loss = F_audio.rnnt_loss(
-                logits,
-                tokens.int(),
-                encoder_lengths.int(),
-                token_lengths.int(),
-                blank=model.blank_id,
+                logits.float().cpu(),  # Ensure float32 for loss computation
+                tokens.int().cpu(),
+                encoder_lengths.int().cpu(),
+                token_lengths.int().cpu(),
+                blank=blank_id,
                 reduction='mean',
-            )
+            ).to(device)
 
-        # Backward with gradient scaling
+        # Backward with gradient scaling (scaler handles enabled/disabled automatically)
         scaler.scale(loss).backward()
 
         # Gradient clipping
@@ -418,7 +427,7 @@ def get_dataset(config, split: str = "train"):
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
 
-def train(rank, world_size, config, args):
+def train(rank, world_size, config, args, device_info):
     """Main training function."""
     # Setup distributed if multi-GPU
     is_distributed = world_size > 1
@@ -426,9 +435,13 @@ def train(rank, world_size, config, args):
         setup_distributed(rank, world_size)
         device = torch.device(f'cuda:{rank}')
     else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(device_info['device'])
 
     is_main = (rank == 0)
+
+    if is_main:
+        print(f"[Training] Device: {device_info['device_name']}")
+        print(f"[Training] AMP enabled: {device_info['supports_amp']}")
 
     # Initialize wandb (main process only)
     wandb_run = None
@@ -528,8 +541,9 @@ def train(rank, world_size, config, args):
         multiplier=config['training'].get('lr_multiplier', 5),
     )
 
-    # Gradient scaler for mixed precision
-    scaler = GradScaler()
+    # Gradient scaler for mixed precision (device-agnostic)
+    use_amp = config['training'].get('use_amp', True)
+    scaler = get_grad_scaler(device_info, enabled=use_amp)
 
     # Load checkpoint if resuming
     start_epoch = 0
@@ -556,7 +570,7 @@ def train(rank, world_size, config, args):
         # Train
         train_loss = train_epoch(
             model, train_loader, optimizer, scheduler, scaler,
-            device, epoch, config, rank, wandb_run
+            device, device_info, epoch, config, rank, wandb_run
         )
 
         # Validate
@@ -615,21 +629,30 @@ def main():
     # Load config
     config = load_config(args.config)
 
-    # Get device info
+    # Get device info (auto-detect CPU/CUDA/ROCm)
     device_info = get_device_info()
     world_size = device_info['num_devices'] if device_info['use_distributed'] else 1
+
+    print(f"\n{'='*60}")
+    print("FastConformer-Transducer Training")
+    print(f"{'='*60}")
+    print(f"Config: {args.config}")
+    print(f"Device: {device_info['device_name']}")
+    print(f"Distributed: {device_info['use_distributed']}")
+    print(f"World size: {world_size}")
+    print(f"{'='*60}\n")
 
     if world_size > 1:
         # Multi-GPU training
         mp.spawn(
             train,
-            args=(world_size, config, args),
+            args=(world_size, config, args, device_info),
             nprocs=world_size,
             join=True,
         )
     else:
         # Single GPU or CPU training
-        train(0, 1, config, args)
+        train(0, 1, config, args, device_info)
 
 
 if __name__ == '__main__':

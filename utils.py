@@ -149,42 +149,97 @@ def save_config(config: dict, config_path: str):
 def get_device_info() -> dict:
     """
     Detect available devices and return device information.
-    Supports NVIDIA CUDA and AMD ROCm.
+    Supports NVIDIA CUDA, AMD ROCm, and CPU.
+    Auto-detects the best available accelerator.
     """
     device_info = {
         'device': 'cpu',
+        'device_type': 'cpu',  # For autocast: 'cuda' or 'cpu'
         'device_name': 'CPU',
         'num_devices': 0,
         'is_cuda': False,
         'is_rocm': False,
         'use_distributed': False,
+        'supports_amp': False,  # Mixed precision support
     }
 
     if torch.cuda.is_available():
         device_info['num_devices'] = torch.cuda.device_count()
         device_info['is_cuda'] = True
+        device_info['device'] = 'cuda'
+        device_info['device_type'] = 'cuda'  # ROCm uses 'cuda' device_type too
+        device_info['supports_amp'] = True
 
         try:
             device_name = torch.cuda.get_device_name(0)
             if 'AMD' in device_name or 'Radeon' in device_name or 'MI' in device_name:
                 device_info['is_rocm'] = True
-                device_info['device_name'] = f'AMD GPU: {device_name}'
+                device_info['device_name'] = f'AMD GPU (ROCm): {device_name}'
             else:
-                device_info['device_name'] = f'NVIDIA GPU: {device_name}'
+                device_info['device_name'] = f'NVIDIA GPU (CUDA): {device_name}'
         except Exception:
             device_info['device_name'] = 'GPU (unknown type)'
 
-        device_info['device'] = 'cuda'
-
         if device_info['num_devices'] > 1:
             device_info['use_distributed'] = True
-            print(f"Detected {device_info['num_devices']} GPUs - Multi-GPU training available")
+            print(f"[Device] Detected {device_info['num_devices']} GPUs - Multi-GPU training available")
         else:
-            print(f"Detected 1 GPU: {device_info['device_name']}")
+            print(f"[Device] {device_info['device_name']}")
     else:
-        print("No GPU detected, using CPU")
+        # CPU mode - check for torch.compile compatibility
+        print("[Device] No GPU detected, using CPU")
+        # CPU AMP is supported in PyTorch 1.10+ for bfloat16
+        device_info['supports_amp'] = hasattr(torch.cpu.amp, 'autocast') if hasattr(torch, 'cpu') else False
 
     return device_info
+
+
+def get_autocast_context(device_info: dict, enabled: bool = True):
+    """
+    Get the appropriate autocast context for the detected device.
+    Works with NVIDIA CUDA, AMD ROCm, and CPU.
+
+    Args:
+        device_info: Device info from get_device_info()
+        enabled: Whether to enable mixed precision
+
+    Returns:
+        Autocast context manager
+    """
+    from torch.amp import autocast
+
+    if not enabled or not device_info.get('supports_amp', False):
+        # Return a no-op context
+        from contextlib import nullcontext
+        return nullcontext()
+
+    device_type = device_info.get('device_type', 'cpu')
+
+    # For CUDA/ROCm, use float16; for CPU use bfloat16
+    if device_type == 'cuda':
+        return autocast(device_type='cuda', dtype=torch.float16)
+    else:
+        return autocast(device_type='cpu', dtype=torch.bfloat16)
+
+
+def get_grad_scaler(device_info: dict, enabled: bool = True):
+    """
+    Get GradScaler for mixed precision training.
+    GradScaler is only useful for CUDA/ROCm, not CPU.
+
+    Args:
+        device_info: Device info from get_device_info()
+        enabled: Whether to enable gradient scaling
+
+    Returns:
+        GradScaler instance (may be disabled for CPU)
+    """
+    from torch.amp import GradScaler
+
+    # GradScaler is only effective for CUDA devices
+    use_scaler = enabled and device_info.get('device_type') == 'cuda'
+
+    return GradScaler(enabled=use_scaler)
 
 
 def setup_distributed(rank: int, world_size: int):
