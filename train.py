@@ -230,7 +230,7 @@ def validate(model, val_loader, device, text_transform, rank=0):
             mel_lengths = mel_lengths.to(device)
 
             # Encode
-            encoder_out, encoder_lengths, _ = model.encode(mels, mel_lengths, mode="offline")
+            encoder_out, encoder_lengths, _ = model.encode(mels, mel_lengths)
 
             # Greedy decode
             decoded = greedy_decode(model, encoder_out)
