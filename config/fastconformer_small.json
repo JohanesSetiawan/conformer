@@ -39,11 +39,9 @@
     "weight_decay": 1e-6,
     "lr_multiplier": 2.0,
     "warmup_steps": 15000,
-    "grad_clip": 0.5,
-    "use_amp": true,
-    "checkpoint_dir": "./checkpoints/fastconformer_small",
-    "debug": false,
-    "debug_interval": 50
+    "grad_clip": 1.0,
+    "use_amp": false,
+    "checkpoint_dir": "./checkpoints/fastconformer_small"
   },
 
   "streaming": {
