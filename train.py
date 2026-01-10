@@ -284,7 +284,7 @@ def train_epoch(
     nan_loss_count = 0
     nan_grad_count = 0
     total_batches = 0
-    max_nan_skip = config['training'].get('max_nan_skip', 50)
+    max_nan_skip = config['training'].get('max_nan_skip', 100)
 
     for batch_idx, batch in enumerate(pbar):
         total_batches += 1
@@ -314,6 +314,20 @@ def train_epoch(
         # Check for NaN loss
         if torch.isnan(loss) or torch.isinf(loss):
             nan_loss_count += 1
+            # Debug: print constraint check
+            enc_lens = encoder_lengths.tolist()
+            tok_lens = token_lengths.tolist()
+            violations = [(i, e, t) for i, (e, t) in enumerate(zip(enc_lens, tok_lens)) if e < t]
+            print(f"\n[NaN Loss #{nan_loss_count}] batch={batch_idx}")
+            print(f"  enc_lens={enc_lens}")
+            print(f"  tok_lens={tok_lens}")
+            if violations:
+                print(f"  CONSTRAINT VIOLATED: {violations}")
+            else:
+                print(f"  Constraint OK, but loss=NaN. Check logits.")
+                logits_stats = f"min={logits.min().item():.2e}, max={logits.max().item():.2e}"
+                print(f"  logits: {logits_stats}, has_nan={torch.isnan(logits).any().item()}")
+
             if nan_loss_count + nan_grad_count > max_nan_skip:
                 raise RuntimeError(f"Too many NaN (loss={nan_loss_count}, grad={nan_grad_count})")
             continue
@@ -329,6 +343,7 @@ def train_epoch(
         # Check for NaN gradients
         if torch.isnan(grad_norm) or torch.isinf(grad_norm):
             nan_grad_count += 1
+            print(f"\n[NaN Grad #{nan_grad_count}] batch={batch_idx}, loss={loss.item():.2f}, grad_norm={grad_norm}")
             optimizer.zero_grad()
             scaler.update()
             if nan_loss_count + nan_grad_count > max_nan_skip:
