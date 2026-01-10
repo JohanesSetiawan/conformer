@@ -131,52 +131,47 @@ class TransducerDataset(torch.utils.data.Dataset):
 
 
 def collate_fn(batch, subsampling_factor: int = 8):
-    """Collate function for DataLoader with RNN-T length validation.
+    """Collate function for DataLoader with dynamic audio padding.
 
-    RNN-T loss requires encoder_length >= token_length for all samples.
-    This function filters out samples that violate this constraint.
+    Instead of filtering samples, we pad short audio to ensure
+    encoder_length >= token_length (RNN-T requirement).
 
     Args:
         batch: List of (mel, tokens, utterance) tuples
-        subsampling_factor: Encoder subsampling factor (default 8 for FastConformer
-            with 3 conv layers @ stride 2 each = 2*2*2 = 8x subsampling)
+        subsampling_factor: Encoder subsampling factor (default 8 for FastConformer)
 
     Returns:
         Tuple of (mels_padded, mel_lengths, tokens_padded, token_lengths, utterances)
-        Returns None if all samples are filtered out
     """
     mels, tokens, utterances = zip(*batch)
 
-    # Calculate expected encoder lengths after subsampling
-    mel_lengths = [m.size(0) for m in mels]
-    token_lengths = [t.size(0) for t in tokens]
+    # Pad each mel to ensure encoder_length >= token_length
+    # encoder_length ≈ mel_length // subsampling_factor
+    # So we need: mel_length >= token_length * subsampling_factor
+    padded_mels = []
+    mel_lengths = []
+    for mel, tok in zip(mels, tokens):
+        mel_len = mel.size(0)
+        tok_len = tok.size(0)
 
-    # Filter samples that satisfy RNN-T constraint: encoder_length >= token_length
-    # Use conservative estimate with margin for conv layer edge effects
-    valid_indices = []
-    for i, (mel_len, tok_len) in enumerate(zip(mel_lengths, token_lengths)):
-        # Conservative encoder length estimate with margin for conv edge effects
-        # Subtract 2 for conv kernel edge effects to be safe
-        encoder_len = max(1, (mel_len // subsampling_factor) - 2)
-        if encoder_len >= tok_len:
-            valid_indices.append(i)
+        # Calculate minimum mel length needed (with margin for conv edges)
+        min_mel_len = (tok_len + 3) * subsampling_factor  # +3 margin for safety
 
-    # If no valid samples, return None (will be handled in training loop)
-    if len(valid_indices) == 0:
-        return None
+        if mel_len < min_mel_len:
+            # Pad with zeros (silence)
+            pad_len = min_mel_len - mel_len
+            padding = torch.zeros(pad_len, mel.size(1), dtype=mel.dtype)
+            mel = torch.cat([mel, padding], dim=0)
 
-    # Filter to valid samples only
-    if len(valid_indices) < len(batch):
-        mels = [mels[i] for i in valid_indices]
-        tokens = [tokens[i] for i in valid_indices]
-        utterances = [utterances[i] for i in valid_indices]
+        padded_mels.append(mel)
+        mel_lengths.append(mel.size(0))
 
-    # Get lengths before padding
-    mel_lengths = torch.tensor([m.size(0) for m in mels], dtype=torch.long)
+    # Get lengths
+    mel_lengths = torch.tensor(mel_lengths, dtype=torch.long)
     token_lengths = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
 
-    # Pad sequences
-    mels_padded = nn.utils.rnn.pad_sequence(mels, batch_first=True)
+    # Pad sequences to batch
+    mels_padded = nn.utils.rnn.pad_sequence(padded_mels, batch_first=True)
     tokens_padded = nn.utils.rnn.pad_sequence(tokens, batch_first=True)
 
     return mels_padded, mel_lengths, tokens_padded, token_lengths, utterances
@@ -288,18 +283,11 @@ def train_epoch(
     # Tracking counters
     nan_loss_count = 0
     nan_grad_count = 0
-    constraint_skip_count = 0
-    filter_skip_count = 0
     total_batches = 0
     max_nan_skip = config['training'].get('max_nan_skip', 50)
 
     for batch_idx, batch in enumerate(pbar):
         total_batches += 1
-
-        # Handle None batch (all samples filtered due to RNN-T length constraint)
-        if batch is None:
-            filter_skip_count += 1
-            continue
 
         mels, mel_lengths, tokens, token_lengths, _ = batch
         mels = mels.to(device)
@@ -312,12 +300,6 @@ def train_epoch(
         # Mixed precision forward (device-agnostic)
         with get_autocast_context(device_info, enabled=use_amp):
             logits, encoder_lengths = model(mels, mel_lengths, tokens, token_lengths)
-
-            # Runtime validation: check RNN-T constraint
-            constraint_violated = (encoder_lengths < token_lengths).any().item()
-            if constraint_violated:
-                constraint_skip_count += 1
-                continue
 
             # RNN-T loss (compute on CPU for ROCm compatibility)
             loss = F_audio.rnnt_loss(
@@ -367,7 +349,7 @@ def train_epoch(
             'loss': f'{loss_meter.avg:.2f}',
             'lr': f'{current_lr:.2e}',
             'grad': f'{grad_norm_meter.avg:.1f}',
-            'skip': filter_skip_count + constraint_skip_count + nan_loss_count + nan_grad_count,
+            'nan': nan_loss_count + nan_grad_count,
         })
 
         # Log to wandb
@@ -381,10 +363,9 @@ def train_epoch(
 
     # Print epoch summary
     if rank == 0:
-        total_skipped = filter_skip_count + constraint_skip_count + nan_loss_count + nan_grad_count
-        print(f"\n[Epoch {epoch}] loss={loss_meter.avg:.2f} | skipped={total_skipped}/{total_batches} "
-              f"(filter={filter_skip_count}, constraint={constraint_skip_count}, "
-              f"nan_loss={nan_loss_count}, nan_grad={nan_grad_count})")
+        nan_total = nan_loss_count + nan_grad_count
+        print(f"\n[Epoch {epoch}] loss={loss_meter.avg:.2f} | batches={total_batches} | "
+              f"nan={nan_total} (loss={nan_loss_count}, grad={nan_grad_count})")
 
     return loss_meter.avg
 
