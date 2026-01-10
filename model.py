@@ -851,6 +851,11 @@ class FastConformerEncoder(nn.Module):
             output_lengths: (batch,) output lengths
             new_cache: Updated cache list
         """
+        # Input normalization: log compression + standardization
+        # Prevents NaN from large mel values
+        x = torch.log(x + 1e-6)
+        x = (x - x.mean(dim=(1, 2), keepdim=True)) / (x.std(dim=(1, 2), keepdim=True) + 1e-6)
+
         # Subsampling
         x = self.subsampling(x)
 
